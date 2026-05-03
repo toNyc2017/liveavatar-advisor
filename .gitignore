@@ -1,0 +1,51 @@
+# Secrets — never commit
+.env
+.tavus_info
+.liveavatar_info
+.heygen_info
+
+# Python environment + caches
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS junk
+.DS_Store
+
+# Large generated assets (regenerate from annuity_docs + scripts/ingest-docs.js)
+chroma_db/
+
+# Source documents — don't commit (size + Stan the Annuity Man content licensing)
+annuity_docs/
+
+# Training / source videos — large, personal
+*.MOV
+*.mov
+*.mp4
+*.MP4
+
+# Sample frames extracted during diagnostics
+take3*.jpg
+*_check.jpg
+sm_*.jpg
+cmp_*.jpg
+v2_*.jpg
+v3_*.jpg
+sdr_*.jpg
+cal_*.jpg
+fixed_*.jpg
+orig_*.jpg
+A_*.jpg
+B_*.jpg
+C_*.jpg
+f*.jpg
+final_*.jpg
+comparison_*.jpg
+capcut_check_*.jpg
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+.claude/

@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Annuity Advisor — LiveAvatar</title>
+    <style>
+        :root {
+            --bg: #0f1216; --panel: #1a1f26; --panel-edge: #2a313b;
+            --ink: #e8edf2; --muted: #8a94a3;
+            --accent: #4f8cff; --accent-2: #2563eb;
+            --user: #2c3a52; --avatar: #1f2a3d;
+            --danger: #ff4d4d; --good: #2ecc71;
+        }
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+               background: var(--bg); color: var(--ink); margin: 0; padding: 24px;
+               display: flex; justify-content: center; }
+        .app { width: 100%; max-width: 880px; display: grid; gap: 18px; }
+        h1 { font-size: 22px; margin: 0; font-weight: 600; }
+        .subtitle { color: var(--muted); font-size: 13px; margin-top: 4px; }
+        .panel { background: var(--panel); border: 1px solid var(--panel-edge);
+                 border-radius: 12px; padding: 16px; }
+        #video-container { width: 100%; aspect-ratio: 16/9; background: #000;
+            border-radius: 12px; overflow: hidden; position: relative;
+            border: 1px solid var(--panel-edge); }
+        video, audio { width: 100%; height: 100%; object-fit: cover; }
+        .video-placeholder { position: absolute; inset: 0; display: flex;
+            align-items: center; justify-content: center;
+            color: var(--muted); font-size: 14px; }
+        .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+        button { padding: 10px 18px; cursor: pointer; background: var(--accent);
+            color: white; border: none; border-radius: 8px;
+            font-size: 14px; font-weight: 500; transition: background 120ms; }
+        button:hover:not(:disabled) { background: var(--accent-2); }
+        button:disabled { background: #3a4250; color: var(--muted); cursor: not-allowed; }
+        button.secondary { background: #2a313b; color: var(--ink); }
+        button.recording { background: var(--danger);
+            box-shadow: 0 0 0 0 rgba(255, 77, 77, 0.7); animation: pulse 1.4s infinite; }
+        @keyframes pulse {
+            0%   { box-shadow: 0 0 0 0   rgba(255,77,77,.6); }
+            70%  { box-shadow: 0 0 0 14px rgba(255,77,77,0); }
+            100% { box-shadow: 0 0 0 0   rgba(255,77,77,0); }
+        }
+        input[type="text"] { flex-grow: 1; min-width: 200px; padding: 10px 12px;
+            background: #0d1116; color: var(--ink);
+            border: 1px solid var(--panel-edge); border-radius: 8px; font-size: 14px; }
+        input[type="text"]:focus { outline: none; border-color: var(--accent); }
+        .status { display: inline-flex; align-items: center; gap: 6px;
+            font-size: 12px; color: var(--muted); }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
+        .dot.live { background: var(--good); }
+        #transcript { max-height: 280px; overflow-y: auto;
+            display: flex; flex-direction: column; gap: 10px; }
+        .turn { padding: 10px 14px; border-radius: 10px; max-width: 85%;
+            line-height: 1.4; font-size: 14px; }
+        .turn.user   { background: var(--user);   align-self: flex-end; }
+        .turn.avatar { background: var(--avatar); align-self: flex-start; }
+        .turn .who { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+        .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 14px 0; }
+        .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+        kbd { background: #0d1116; border: 1px solid var(--panel-edge);
+            padding: 1px 6px; border-radius: 4px; font-size: 11px; color: var(--ink); }
+    </style>
+</head>
+<body>
+<div class="app">
+
+    <header>
+        <h1>Annuity Advisor</h1>
+        <div class="subtitle">LiveAvatar (HeyGen) + GPT-4o · LITE mode</div>
+    </header>
+
+    <div id="video-container">
+        <div class="video-placeholder" id="placeholder">Avatar will appear here once the session starts.</div>
+        <video id="avatar-media" autoplay playsinline style="display:none;"></video>
+    </div>
+
+    <div class="panel">
+        <div class="controls">
+            <button id="start-btn">Start session</button>
+            <button id="stop-btn" class="secondary" disabled>End session</button>
+            <span class="status"><span id="conn-dot" class="dot"></span><span id="conn-text">Disconnected</span></span>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="controls">
+            <button id="talk-btn" disabled>🎤 Hold to talk</button>
+            <input type="text" id="user-input" placeholder="…or type a question and press Enter" disabled>
+            <button id="ask-btn" disabled>Send</button>
+        </div>
+        <div class="hint">
+            Hold <kbd>Space</kbd> or click & hold the mic button. Voice input uses the
+            browser's Web Speech API; the avatar's reply uses HeyGen's built-in voice.
+        </div>
+    </div>
+
+    <div class="panel">
+        <div id="transcript">
+            <div class="empty" id="transcript-empty">No conversation yet — start the session and ask a question.</div>
+        </div>
+    </div>
+
+</div>
+
+<!--
+  We use the official SDK from a CDN ESM build. The SDK encapsulates:
+    • POST /v1/sessions/start → SessionInfo { livekit_url, livekit_client_token, ws_url, ... }
+    • LiveKit room connect
+    • Optional WebSocket (ws_url) for command events
+    • CommandEvents like "avatar.speak_text" published over the right transport
+-->
+<script type="module">
+import { LiveAvatarSession, AgentEventsEnum, SessionEvent }
+    from "https://esm.sh/@heygen/liveavatar-web-sdk@0.0.17";
+
+const $ = (id) => document.getElementById(id);
+const mediaEl = $("avatar-media"), placeholderEl = $("placeholder"),
+      startBtn = $("start-btn"), stopBtn = $("stop-btn"),
+      talkBtn = $("talk-btn"), askBtn = $("ask-btn"),
+      inputEl = $("user-input"), transcriptEl = $("transcript"),
+      emptyEl = $("transcript-empty"),
+      dotEl = $("conn-dot"), dotText = $("conn-text");
+
+const API = window.location.origin.startsWith("http")
+    ? window.location.origin : "http://localhost:8000";
+
+let session = null;
+let sessionId = null;       // we use the SDK's session info (or generate a short id) for backend keying
+let recognition = null, recognizing = false, pendingTranscript = "";
+
+// ---------- Transcript UI ----------
+function addTurn(who, text) {
+    if (emptyEl) emptyEl.remove();
+    const wrap = document.createElement("div");
+    wrap.className = `turn ${who}`;
+    const label = document.createElement("div");
+    label.className = "who";
+    label.textContent = who === "user" ? "You" : "Advisor";
+    const body = document.createElement("div");
+    body.textContent = text;
+    wrap.append(label, body);
+    transcriptEl.appendChild(wrap);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    return body;
+}
+function setStatus(label, live) {
+    dotText.textContent = label;
+    dotEl.classList.toggle("live", !!live);
+}
+
+// ---------- Session lifecycle ----------
+startBtn.addEventListener("click", async () => {
+    startBtn.disabled = true; startBtn.textContent = "Starting…";
+    setStatus("Connecting…", false);
+
+    try {
+        const tokenRes = await fetch(`${API}/api/token`, { method: "POST" });
+        const tokenData = await tokenRes.json();
+        if (!tokenRes.ok) throw new Error(tokenData.detail || JSON.stringify(tokenData));
+
+        // Construct + start the SDK session. voiceChat:false because we'll do
+        // push-to-talk via Web Speech API; flip to true to let LiveAvatar
+        // capture the mic itself and pipe it over LiveKit.
+        session = new LiveAvatarSession(tokenData.session_token, { voiceChat: false });
+
+        // Surface the avatar transcription chunks in our UI as they arrive.
+        let avatarBody = null;
+        session.on(AgentEventsEnum.AVATAR_TRANSCRIPTION_CHUNK, (e) => {
+            if (!avatarBody) avatarBody = addTurn("avatar", "");
+            avatarBody.textContent += e.text || "";
+            transcriptEl.scrollTop = transcriptEl.scrollHeight;
+        });
+        session.on(AgentEventsEnum.AVATAR_SPEAK_ENDED, () => { avatarBody = null; });
+        session.on(SessionEvent.SESSION_DISCONNECTED, (reason) => {
+            setStatus(`Disconnected (${reason})`, false);
+        });
+        session.on(SessionEvent.SESSION_STREAM_READY, () => {
+            session.attach(mediaEl);
+            mediaEl.style.display = "block";
+            placeholderEl.style.display = "none";
+        });
+
+        await session.start();
+
+        // Use a short identifier for backend conversation memory keying.
+        sessionId = crypto.randomUUID();
+
+        setStatus("Live", true);
+        startBtn.textContent = "Connected";
+        stopBtn.disabled = false;
+        inputEl.disabled = false; askBtn.disabled = false;
+        talkBtn.disabled = !setupSpeechRecognition();
+        if (talkBtn.disabled) talkBtn.title = "Speech recognition not supported here. Use Chrome.";
+    } catch (err) {
+        console.error(err);
+        alert("Failed to start session:\n\n" + err.message);
+        startBtn.disabled = false; startBtn.textContent = "Start session";
+        setStatus("Disconnected", false);
+    }
+});
+
+stopBtn.addEventListener("click", async () => {
+    stopBtn.disabled = true;
+    try {
+        if (session) { await session.stop(); session = null; }
+        if (sessionId) {
+            fetch(`${API}/api/forget`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ session_id: sessionId }),
+            }).catch(() => {});
+        }
+    } catch (e) { console.warn(e); }
+    sessionId = null;
+    mediaEl.style.display = "none";
+    placeholderEl.style.display = "flex";
+    startBtn.disabled = false; startBtn.textContent = "Start session";
+    inputEl.disabled = true; askBtn.disabled = true; talkBtn.disabled = true;
+    setStatus("Disconnected", false);
+});
+
+// ---------- Asking ----------
+async function ask(text) {
+    text = (text || "").trim();
+    if (!text || !session || !sessionId) return;
+    addTurn("user", text);
+    inputEl.value = "";
+    inputEl.disabled = true; askBtn.disabled = true; talkBtn.disabled = true;
+    try {
+        const res = await fetch(`${API}/api/llm`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, user_text: text }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+
+        // Make the avatar lip-sync to ElevenLabs audio via session.repeatAudio().
+        // AVATAR_TRANSCRIPTION_CHUNK doesn't fire for repeatAudio, so we add the
+        // reply text to the transcript ourselves before speech starts.
+        const advisorBody = addTurn("avatar", data.reply);
+        await speakViaElevenLabs(data.reply);
+        // Note: we do NOT addTurn("avatar", data.reply) here, because
+        // AVATAR_TRANSCRIPTION_CHUNK events will stream the spoken transcript
+        // into the UI as the avatar speaks it.
+    } catch (err) {
+        console.error(err);
+        addTurn("avatar", "⚠️ " + err.message);
+    } finally {
+        inputEl.disabled = false; askBtn.disabled = false; talkBtn.disabled = !recognition;
+        inputEl.focus();
+    }
+}
+// ---------- ElevenLabs TTS → avatar lip-sync ----------
+function b64Encode(arrayBuffer) {
+    const bytes = new Uint8Array(arrayBuffer);
+    let binary = '';
+    const CHUNK = 8192;
+    for (let i = 0; i < bytes.byteLength; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(binary);
+}
+
+async function speakViaElevenLabs(text) {
+    const res = await fetch(`${API}/api/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+    });
+    if (!res.ok) throw new Error(`TTS ${res.status}: ${await res.text()}`);
+    const buf = await res.arrayBuffer();
+
+    const FIRST = 19200;   // 400 ms at 24 kHz × 16-bit mono
+    const REST  = 48000;   // 1 s chunks thereafter
+
+    let offset = 0, first = true;
+    while (offset < buf.byteLength) {
+        const size  = first ? FIRST : REST;
+        const slice = buf.slice(offset, offset + size);
+        offset += size;
+        first = false;
+        session.repeatAudio(b64Encode(slice));
+        await new Promise(r => setTimeout(r, 50));
+    }
+}
+
+askBtn.addEventListener("click", () => ask(inputEl.value));
+inputEl.addEventListener("keypress", (e) => { if (e.key === "Enter") ask(inputEl.value); });
+
+// ---------- Push-to-talk (Web Speech API) ----------
+function setupSpeechRecognition() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) return false;
+    recognition = new SR();
+    recognition.lang = "en-US";
+    recognition.interimResults = true;
+    recognition.continuous = false;
+    recognition.onresult = (ev) => {
+        let combined = "";
+        for (let i = 0; i < ev.results.length; i++) combined += ev.results[i][0].transcript;
+        pendingTranscript = combined.trim();
+        inputEl.value = pendingTranscript;
+    };
+    recognition.onend = () => {
+        recognizing = false;
+        talkBtn.classList.remove("recording");
+        talkBtn.textContent = "🎤 Hold to talk";
+        if (pendingTranscript) { const t = pendingTranscript; pendingTranscript = ""; ask(t); }
+    };
+    recognition.onerror = (e) => {
+        console.warn("speech error", e.error);
+        recognizing = false;
+        talkBtn.classList.remove("recording");
+        talkBtn.textContent = "🎤 Hold to talk";
+    };
+    return true;
+}
+function startTalking() {
+    if (!recognition || recognizing || !session) return;
+    try {
+        pendingTranscript = ""; inputEl.value = "";
+        recognition.start();
+        recognizing = true;
+        talkBtn.classList.add("recording");
+        talkBtn.textContent = "● Listening…";
+    } catch (e) { console.warn(e); }
+}
+function stopTalking() {
+    if (!recognition || !recognizing) return;
+    try { recognition.stop(); } catch (_) {}
+}
+talkBtn.addEventListener("mousedown", startTalking);
+talkBtn.addEventListener("touchstart", (e) => { e.preventDefault(); startTalking(); });
+document.addEventListener("mouseup", stopTalking);
+document.addEventListener("touchend", stopTalking);
+document.addEventListener("keydown", (e) => {
+    if (e.code === "Space" && document.activeElement !== inputEl && !recognizing && session) {
+        e.preventDefault(); startTalking();
+    }
+});
+document.addEventListener("keyup", (e) => {
+    if (e.code === "Space" && recognizing) { e.preventDefault(); stopTalking(); }
+});
+</script>
+</body>
+</html>
