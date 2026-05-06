@@ -25,7 +25,7 @@ annuity_docs/
 *.mp4
 *.MP4
 
-# Sample frames extracted during diagnostics
+# Sample frames + debug artifacts extracted during diagnostics
 take3*.jpg
 *_check.jpg
 sm_*.jpg
@@ -43,6 +43,11 @@ f*.jpg
 final_*.jpg
 comparison_*.jpg
 capcut_check_*.jpg
+composite_*.jpg
+bg_test_*.jpg
+bg_cutout_*.jpg
+bg_cutout_*.png
+books_*.jpg
 
 # Editor / IDE
 .idea/
