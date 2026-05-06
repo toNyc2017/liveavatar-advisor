@@ -1,8 +1,21 @@
+# Core web stack
 fastapi>=0.115
 uvicorn[standard]>=0.32
 httpx>=0.28
-openai>=1.50
+
+# Auth + config
 python-dotenv>=1.0
+
+# LLM + voice + vector store
+openai>=1.50
 elevenlabs>=1.10
 chromadb>=0.4
+
+# Document parsing (used by ingest scripts for .docx)
 python-docx>=1.1
+
+# Background-replacement pipeline (bg_replace.py)
+# mediapipe pinned to the 0.10.x line that has the Tasks API; 0.11+ is too new
+mediapipe>=0.10.30,<0.11
+opencv-python-headless>=4.8
+numpy>=1.26
