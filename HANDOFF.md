@@ -16,7 +16,7 @@
 A back-and-forth voice conversation with a HeyGen **LiveAvatar** acting as
 an annuity advisor. **LITE mode**: backend mints a session token; frontend
 uses the official `@heygen/liveavatar-web-sdk` to attach to the LiveKit
-room and send command events. Text replies come from GPT-4o on the backend;
+room and send command events. Text replies come from the LLM on the backend (default GPT-5.4);
 the avatar speaks them via HeyGen's built-in voice (`session.repeat(text)`).
 
 ## Repo state

@@ -11,7 +11,7 @@ A real-time conversational avatar of **Tom Olds** acting as a financial advisor 
 ## Stack (one screen)
 
 ```
-Browser ─── push-to-talk (Web Speech API STT) ──→ /api/llm ──→ GPT-4o
+Browser ─── push-to-talk (Web Speech API STT) ──→ /api/llm ──→ GPT-5.4
                                                        │
                                                        ↓
                                                    ChromaDB RAG retrieval
@@ -40,7 +40,7 @@ Browser ─── push-to-talk (Web Speech API STT) ──→ /api/llm ──→
 - `GET /` — serves `index.html`
 - `GET /health` — diagnostic JSON (which keys loaded, which avatar id active, etc.)
 - `POST /api/token` — mints LiveAvatar session token via `api.liveavatar.com/v1/sessions/token`
-- `POST /api/llm` — RAG retrieval over ChromaDB + GPT-4o with the advisor system prompt + per-session memory
+- `POST /api/llm` — RAG retrieval over ChromaDB + GPT-5.4 with the advisor system prompt + per-session memory
 - `POST /api/tts` — ElevenLabs PCM 24kHz synthesis of arbitrary text
 - `POST /api/forget` — clears in-memory transcript for a session_id
 
@@ -52,12 +52,12 @@ Browser ─── push-to-talk (Web Speech API STT) ──→ /api/llm ──→
 
 **Voice**: ElevenLabs voice ID `8gfvBkrqr64Si4V5Q321` (Tom's clone, originally trained for the AudiblyLegibleInsights project, reused here).
 
-**LLM**: GPT-4o, system prompt focused on annuity advisor persona — explicitly told NOT to refer the user to "another professional" (Tom IS the professional).
+**LLM**: GPT-5.4 (`gpt-5.4`), system prompt focused on annuity advisor persona — explicitly told NOT to refer the user to "another professional" (Tom IS the professional). Model is configurable via `LLM_MODEL` env var.
 
 **RAG**: ChromaDB at `chroma_db/`, collection `annuity_docs`, embedded with `text-embedding-3-small`. Source corpus is in `annuity_docs/` (Stan the Annuity Man transcripts and related). Ingested via `scripts/ingest-docs.js` (Node) or `scripts/ingest.py` (Python).
 
 **Auth and credentials** (`.env`, never committed):
-- `OPENAI_API_KEY` — for GPT-4o + embeddings
+- `OPENAI_API_KEY` — for GPT-5.4 + embeddings
 - `LIVEAVATAR_API_KEY` — UUID-format key from `app.liveavatar.com/developers`. Distinct from the HeyGen API key (separate products despite shared branding).
 - `HEYGEN_API_KEY` — `sk_V2_...` format key from app.heygen.com. Kept for completeness; not used by the running app.
 - `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID`

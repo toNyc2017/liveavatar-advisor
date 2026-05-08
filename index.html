@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Annuity Advisor — LiveAvatar</title>
+    <!-- jsPDF for client-side PDF generation of calculator results.
+         Loaded from CDN, no backend dependency. ~50KB. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
     <style>
         :root {
             --bg: #0f1216; --panel: #1a1f26; --panel-edge: #2a313b;
@@ -61,6 +64,22 @@
         .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
         kbd { background: #0d1116; border: 1px solid var(--panel-edge);
             padding: 1px 6px; border-radius: 4px; font-size: 11px; color: var(--ink); }
+
+        /* Calculator results panel */
+        .calc-panel { border-color: #4f8cff80; }
+        .calc-header { display: flex; align-items: center; justify-content: space-between;
+            gap: 12px; margin-bottom: 12px; }
+        .calc-header h3 { margin: 0; font-size: 16px; font-weight: 600; }
+        .calc-actions { display: flex; gap: 6px; }
+        .calc-actions button { padding: 6px 10px; font-size: 12px; }
+        .calc-row { display: grid; grid-template-columns: 200px 1fr;
+            gap: 4px 12px; padding: 6px 0; border-bottom: 1px solid #ffffff10; }
+        .calc-row:last-child { border-bottom: none; }
+        .calc-label { color: var(--muted); font-size: 13px; }
+        .calc-value { font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; }
+        .calc-value.big { font-size: 18px; color: #4f8cff; }
+        .calc-disclaimer { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--panel-edge);
+            font-size: 11px; color: var(--muted); line-height: 1.5; }
     </style>
 </head>
 <body>
@@ -68,7 +87,7 @@
 
     <header>
         <h1>Annuity Advisor</h1>
-        <div class="subtitle">LiveAvatar (HeyGen) + GPT-4o · LITE mode</div>
+        <div class="subtitle">LiveAvatar (HeyGen) + GPT-5.4 · LITE mode</div>
     </header>
 
     <div id="video-container">
@@ -100,6 +119,21 @@
         <div id="transcript">
             <div class="empty" id="transcript-empty">No conversation yet — start the session and ask a question.</div>
         </div>
+    </div>
+
+    <!-- Calculator results panel — shown only when /api/llm returns calculator_result -->
+    <div class="panel calc-panel" id="calc-panel" style="display:none;">
+        <div class="calc-header">
+            <h3>Annuity Income Estimate</h3>
+            <div class="calc-actions">
+                <button id="calc-download-pdf" class="secondary" title="Download as PDF">📑 .pdf</button>
+                <button id="calc-download-txt" class="secondary" title="Download as text">📄 .txt</button>
+                <button id="calc-download-json" class="secondary" title="Download structured JSON">{ } .json</button>
+                <button id="calc-close" class="secondary" title="Hide this estimate">✕</button>
+            </div>
+        </div>
+        <div id="calc-body"></div>
+        <div class="calc-disclaimer" id="calc-disclaimer"></div>
     </div>
 
 </div>
@@ -150,6 +184,196 @@ function setStatus(label, live) {
     dotEl.classList.toggle("live", !!live);
 }
 
+// ---------- Calculator results panel ----------
+let _lastCalcResult = null;  // kept around for the download buttons
+
+function fmtUsd(n) {
+    return "$" + Number(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function row(label, value, big) {
+    return `<div class="calc-row">
+        <div class="calc-label">${label}</div>
+        <div class="calc-value${big ? " big" : ""}">${value}</div>
+    </div>`;
+}
+function renderCalculatorResult(r) {
+    _lastCalcResult = r;
+    const panel = $("calc-panel");
+    const body = $("calc-body");
+    const disc = $("calc-disclaimer");
+    let html = "";
+    html += row("Premium invested", fmtUsd(r.premium));
+    html += row("Annuitant", `Age ${r.age}, ${r.gender}`);
+    html += row("Payout structure", r.payout_type_label);
+    html += row("Monthly income", fmtUsd(r.monthly_income), true);
+    html += row("Annual income", fmtUsd(r.annual_income), true);
+    html += row("Payout rate", r.payout_rate_pct.toFixed(2) + "% of premium per year");
+    html += row("Estimated life expectancy", r.life_expectancy_years + " years");
+    html += row("Total lifetime income (illustrative)", fmtUsd(r.estimated_lifetime_income));
+    if (r.guaranteed_years) {
+        html += row(`Guaranteed first ${r.guaranteed_years} years`,
+            fmtUsd(r.guaranteed_total) + " total even on early death");
+    } else if (r.guaranteed_total) {
+        html += row("Cash refund minimum", fmtUsd(r.guaranteed_total));
+    }
+    html += row("Calculation date", r.calculation_date);
+    body.innerHTML = html;
+    disc.textContent = r.disclaimer;
+    panel.style.display = "block";
+}
+function spiaTextReport(r) {
+    // Mirrors scripts/spia_calculator.py format_for_display, kept here so .txt
+    // download works without a server roundtrip.
+    const lines = [
+        "═══ Annuity Income Estimate ═══",
+        "",
+        `  Premium invested      : ${fmtUsd(r.premium)}`,
+        `  Annuitant age         : ${r.age} (${r.gender})`,
+        `  Payout structure      : ${r.payout_type_label}`,
+        "",
+        "  Estimated income:",
+        `    Annual              : ${fmtUsd(r.annual_income)}`,
+        `    Monthly             : ${fmtUsd(r.monthly_income)}`,
+        `    Payout rate         : ${r.payout_rate_pct.toFixed(2)}% of premium per year`,
+        "",
+        `  Estimated life expectancy at this age: ${r.life_expectancy_years} years`,
+        `  Total lifetime income (illustrative): ${fmtUsd(r.estimated_lifetime_income)}`,
+    ];
+    if (r.guaranteed_years) {
+        lines.push("", `  Guaranteed for first ${r.guaranteed_years} years even on early death:`,
+            `    ${fmtUsd(r.guaranteed_total)} total`);
+    } else if (r.guaranteed_total) {
+        lines.push("", "  Cash refund minimum (returns unused premium at death):",
+            `    ${fmtUsd(r.guaranteed_total)}`);
+    }
+    lines.push("", `  Calculation date: ${r.calculation_date}`, "",
+        "  ─── Important ───", "  " + r.disclaimer);
+    return lines.join("\n");
+}
+function downloadBlob(filename, content, mime) {
+    const blob = new Blob([content], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+function spiaPdfDownload(r) {
+    if (!window.jspdf) {
+        alert("PDF library failed to load. Try the .txt download or hard-reload the page.");
+        return;
+    }
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: "pt", format: "letter" });
+    const PAGE_W = 612;
+    const M = 56;        // margin
+    const COL = 220;     // label column width
+    let y = M;
+
+    // ---- Title ----
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(20);
+    doc.text("Annuity Income Estimate", M, y);
+    y += 22;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    doc.setTextColor(120);
+    doc.text(`Prepared ${r.calculation_date}`, M, y);
+    y += 8;
+    doc.setDrawColor(200);
+    doc.line(M, y, PAGE_W - M, y);
+    y += 22;
+    doc.setTextColor(0);
+
+    // ---- Helper ----
+    const addRow = (label, value, opts = {}) => {
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(10);
+        doc.setTextColor(110);
+        doc.text(label, M, y);
+        doc.setTextColor(0);
+        if (opts.big) {
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(13);
+        } else {
+            doc.setFont("helvetica", "normal");
+            doc.setFontSize(11);
+        }
+        doc.text(String(value), M + COL, y);
+        y += opts.big ? 22 : 16;
+    };
+    const addSectionGap = (h = 12) => { y += h; };
+    const addSubhead = (text) => {
+        addSectionGap(4);
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(11);
+        doc.setTextColor(60);
+        doc.text(text, M, y);
+        y += 14;
+        doc.setTextColor(0);
+    };
+
+    // ---- Sections ----
+    addSubhead("Inputs");
+    addRow("Premium invested", fmtUsd(r.premium));
+    addRow("Annuitant", `Age ${r.age}, ${r.gender}`);
+    addRow("Payout structure", r.payout_type_label);
+
+    addSubhead("Estimated income");
+    addRow("Monthly", fmtUsd(r.monthly_income), { big: true });
+    addRow("Annual", fmtUsd(r.annual_income), { big: true });
+    addRow("Payout rate", r.payout_rate_pct.toFixed(2) + "% of premium per year");
+
+    addSubhead("Lifetime estimates");
+    addRow("Estimated life expectancy", r.life_expectancy_years + " years");
+    addRow("Total lifetime income", fmtUsd(r.estimated_lifetime_income));
+
+    if (r.guaranteed_years) {
+        addSubhead(`Guaranteed first ${r.guaranteed_years} years`);
+        addRow("Total even on early death", fmtUsd(r.guaranteed_total));
+    } else if (r.guaranteed_total) {
+        addSubhead("Cash refund minimum");
+        addRow("Returns unused premium at death", fmtUsd(r.guaranteed_total));
+    }
+
+    // ---- Disclaimer footer ----
+    addSectionGap(20);
+    doc.setDrawColor(200);
+    doc.line(M, y, PAGE_W - M, y);
+    y += 14;
+    doc.setFont("helvetica", "italic");
+    doc.setFontSize(9);
+    doc.setTextColor(110);
+    const wrapped = doc.splitTextToSize(r.disclaimer, PAGE_W - 2 * M);
+    doc.text(wrapped, M, y);
+
+    // ---- Save ----
+    const stamp = new Date().toISOString().slice(0, 10);
+    doc.save(`annuity_estimate_${stamp}.pdf`);
+}
+
+$("calc-download-pdf").addEventListener("click", () => {
+    if (!_lastCalcResult) return;
+    spiaPdfDownload(_lastCalcResult);
+});
+
+$("calc-download-txt").addEventListener("click", () => {
+    if (!_lastCalcResult) return;
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadBlob(`annuity_estimate_${stamp}.txt`, spiaTextReport(_lastCalcResult), "text/plain");
+});
+$("calc-download-json").addEventListener("click", () => {
+    if (!_lastCalcResult) return;
+    const stamp = new Date().toISOString().slice(0, 10);
+    downloadBlob(`annuity_estimate_${stamp}.json`,
+        JSON.stringify(_lastCalcResult, null, 2), "application/json");
+});
+$("calc-close").addEventListener("click", () => {
+    $("calc-panel").style.display = "none";
+});
+
 // ---------- Session lifecycle ----------
 startBtn.addEventListener("click", async () => {
     startBtn.disabled = true; startBtn.textContent = "Starting…";
@@ -185,7 +409,15 @@ startBtn.addEventListener("click", async () => {
         await session.start();
 
         // Use a short identifier for backend conversation memory keying.
-        sessionId = crypto.randomUUID();
+        // crypto.randomUUID() only exists in "secure contexts" (https or
+        // localhost/127.0.0.1 over http). Loading via http://0.0.0.0:8000
+        // or any LAN IP fails it; fall back to a manual RFC-4122-ish UUID.
+        sessionId =
+            (window.crypto && window.crypto.randomUUID && window.crypto.randomUUID()) ||
+            "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+                const r = (Math.random() * 16) | 0;
+                return (c === "x" ? r : (r & 3) | 8).toString(16);
+            });
 
         setStatus("Live", true);
         startBtn.textContent = "Connected";
@@ -234,6 +466,13 @@ async function ask(text) {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+
+        // If the LLM ran the SPIA calculator, show the structured result panel
+        // BEFORE the avatar starts speaking — viewer sees the numbers while
+        // they hear the conversational summary.
+        if (data.calculator_result) {
+            renderCalculatorResult(data.calculator_result);
+        }
 
         // Make the avatar lip-sync to ElevenLabs audio via session.repeatAudio().
         // AVATAR_TRANSCRIPTION_CHUNK doesn't fire for repeatAudio, so we add the

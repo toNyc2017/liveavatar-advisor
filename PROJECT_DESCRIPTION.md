@@ -25,7 +25,7 @@ A Python FastAPI server with four active endpoints:
 | Endpoint | Role |
 |---|---|
 | `POST /api/token` | Mints a short-lived HeyGen LiveAvatar session token; browser uses this to connect to the avatar room |
-| `POST /api/llm` | Receives user question → retrieves relevant document chunks from ChromaDB → constructs a RAG-augmented prompt → calls GPT-4o → returns the reply text |
+| `POST /api/llm` | Receives user question → retrieves relevant document chunks from ChromaDB → constructs a RAG-augmented prompt → calls GPT-5.4 → returns the reply text |
 | `POST /api/tts` | Converts reply text to speech via ElevenLabs (`eleven_turbo_v2`, 24kHz PCM) using a custom cloned voice |
 | `POST /api/forget` | Clears per-session conversation memory when a session ends |
 
@@ -38,8 +38,8 @@ A custom cloned voice ("Yorkville2", voice ID `8gfvBkrqr64Si4V5Q321`) synthesize
 **Knowledge base (ChromaDB + RAG)**
 - **Corpus:** ~580 documents in `annuity_docs/` — a mix of Stan the Annuity Man podcast transcripts, blog posts, and structured summaries covering fixed index annuities, MYGAs, hybrid pensions, income riders, Social Security timing, annuity carrier evaluation, and related retirement income topics. Also includes academic/educational content from Wade Pfau (retirement income researcher).
 - **Vector store:** ChromaDB (`PersistentClient`), collection `annuity_docs`, 4,524 chunks, embedded with OpenAI `text-embedding-3-small` (1000-char chunks, 200-char overlap).
-- **Retrieval:** At query time, the user's question is embedded and the top-4 most semantically relevant chunks are injected into the GPT-4o system prompt as grounding context. This is standard RAG (Retrieval-Augmented Generation).
-- **LLM:** GPT-4o with a persona prompt constraining replies to 2–4 spoken sentences, conversational tone, no markdown, no personalized financial advice.
+- **Retrieval:** At query time, the user's question is embedded and the top-4 most semantically relevant chunks are injected into the GPT-5.4 system prompt as grounding context. This is standard RAG (Retrieval-Augmented Generation).
+- **LLM:** GPT-5.4 with a persona prompt constraining replies to 2–4 spoken sentences, conversational tone, no markdown, no personalized financial advice.
 
 **Conversation memory**
 Per-session rolling transcript (last 12 turns) stored in-process, keyed by session UUID. Enables multi-turn follow-up questions within a session.
@@ -67,7 +67,7 @@ The system has been trained (via RAG) on content covering:
 ## Current Capabilities
 
 - **Real-time voice conversation** with a photorealistic avatar, sub-5-second response latency (LLM + TTS combined)
-- **Document-grounded answers:** responds from the corpus, not purely from GPT-4o's parametric knowledge
+- **Document-grounded answers:** responds from the corpus, not purely from GPT-5.4's parametric knowledge
 - **Multi-turn memory:** follows a conversation thread, handles follow-up questions and pronoun references
 - **Push-to-talk and text input:** browser mic via Web Speech API, or typed questions
 - **Graceful degradation:** if RAG retrieval fails, falls back to base LLM without crashing
@@ -142,11 +142,11 @@ These are not built yet but are architecturally straightforward given the curren
 
 - **Current state:** local development server (`uvicorn`, port 8000, macOS)
 - **Production path:** stateless FastAPI backend is trivially deployable as AWS Lambda + API Gateway or a containerized service (Railway, Fly.io, ECS). The two main stateful dependencies — ChromaDB (file-based) and in-process conversation history — both have straightforward cloud equivalents (S3-backed ChromaDB or a managed vector DB; DynamoDB for session state)
-- **Operating costs (estimated at scale):** HeyGen LITE session minutes + ElevenLabs TTS characters + OpenAI embedding + GPT-4o tokens. At typical lead-gen volumes (hundreds of sessions/day, not thousands) this runs well under $1 per completed conversation
-- **No proprietary lock-in:** LLM (GPT-4o → swappable), TTS (ElevenLabs → swappable), avatar (HeyGen → swappable if they ship competing SDK). The RAG corpus and conversation design are the durable assets
+- **Operating costs (estimated at scale):** HeyGen LITE session minutes + ElevenLabs TTS characters + OpenAI embedding + GPT-5.4 tokens. At typical lead-gen volumes (hundreds of sessions/day, not thousands) this runs well under $1 per completed conversation
+- **No proprietary lock-in:** LLM (GPT-5.4 → swappable), TTS (ElevenLabs → swappable), avatar (HeyGen → swappable if they ship competing SDK). The RAG corpus and conversation design are the durable assets
 
 ---
 
 ## Summary Statement (for LLM downstream consumption)
 
-The LiveAvatar Annuity Advisor is a production-ready prototype of an AI-powered, voice-driven, avatar-based annuity education assistant. It combines a photorealistic lip-synced avatar (HeyGen), a custom cloned voice (ElevenLabs), retrieval-augmented generation over a 4,500-chunk annuity knowledge base, and GPT-4o for conversational reasoning. It is designed for top-of-funnel prospect education and middle-of-funnel qualification in the annuity distribution channel. It does not yet capture leads or integrate with CRM, but those extensions are architecturally straightforward. Its core proposition is delivering consistent, expert-level annuity education at scale, 24/7, with a human-feeling interaction quality that static content and basic chatbots cannot match.
+The LiveAvatar Annuity Advisor is a production-ready prototype of an AI-powered, voice-driven, avatar-based annuity education assistant. It combines a photorealistic lip-synced avatar (HeyGen), a custom cloned voice (ElevenLabs), retrieval-augmented generation over a 4,500-chunk annuity knowledge base, and GPT-5.4 for conversational reasoning. It is designed for top-of-funnel prospect education and middle-of-funnel qualification in the annuity distribution channel. It does not yet capture leads or integrate with CRM, but those extensions are architecturally straightforward. Its core proposition is delivering consistent, expert-level annuity education at scale, 24/7, with a human-feeling interaction quality that static content and basic chatbots cannot match.

@@ -2,7 +2,7 @@
 
 Back-and-forth voice conversation with a HeyGen **LiveAvatar** acting as an
 annuity advisor. LITE mode, push-to-talk via the browser's Web Speech API,
-GPT-4o for the brain, HeyGen for avatar video + voice + lip-sync.
+GPT-5.4 for the brain, HeyGen for avatar video + voice + lip-sync.
 
 > **If you're a Claude Code session picking this up, read [`HANDOFF.md`](./HANDOFF.md) first** — it has the full LITE-mode protocol, prior wrong turns, and a verification checklist.
 
@@ -13,7 +13,7 @@ Browser ── /api/token  ──> backend ──> POST api.liveavatar.com/v1/se
        <─ session_token ──┘                                       (avatar_id, mode=LITE)
 Browser ── new LiveAvatarSession(token).start()  (official @heygen/liveavatar-web-sdk)
        <── LiveKit room (avatar video + audio) ──
-Browser ── /api/llm ──> backend asks GPT-4o ──> reply text
+Browser ── /api/llm ──> backend asks GPT-5.4 ──> reply text
 Browser ── session.repeat(reply) ──> avatar speaks in HeyGen voice
 ```
 
