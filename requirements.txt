@@ -19,3 +19,10 @@ python-docx>=1.1
 mediapipe>=0.10.30,<0.11
 opencv-python-headless>=4.8
 numpy>=1.26
+
+# Podcast ingestion (scripts/fetch_podcast_episodes.py — iTunes RSS path)
+feedparser>=6.0
+requests>=2.31
+
+# YouTube ingestion (scripts/fetch_youtube_episodes.py)
+yt-dlp>=2024.4.9

@@ -19,6 +19,9 @@ chroma_db/
 # Source documents — don't commit (size + Stan the Annuity Man content licensing)
 annuity_docs/
 
+# Podcast pipeline — downloaded MP3s and the dedup manifest
+podcast_audio/
+
 # Training / source videos — large, personal
 *.MOV
 *.mov
