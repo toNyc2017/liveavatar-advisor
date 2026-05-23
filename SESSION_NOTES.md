@@ -129,6 +129,24 @@ python bg_replace.py SOURCE.mp4 OUTPUT.mp4 BACKGROUND.jpg
 ffmpeg -i OUTPUT.mp4 -vcodec libx264 -preset slow -crf 18 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv -acodec copy -movflags +faststart OUTPUT_h264.mp4
 ```
 
+**Skin-smooth a new training video** (recreates the TAKE_3_SDR_smooth_30.mp4 pipeline):
+```
+# Full pipeline at strength 30 (the canonical setting)
+./scripts/smooth_video.sh smooth NEW_RAW.MOV 30 NEW_SDR_smooth_30.mp4
+
+# OR do a comparison sweep first if lighting/skin is meaningfully
+# different from the original shoot — produces variants at 0/20/30/40/60
+# plus a side-by-side comparison_grid.jpg so you can pick the strength
+# that reads best for the new face/lighting
+./scripts/smooth_video.sh sweep NEW_RAW.MOV
+```
+Two-stage pipeline: detects whether the input is iPhone HDR and converts
+to SDR rec.709 H.264 if needed, then applies an ffmpeg bilateral filter
+(`sigmaS=<strength>:sigmaR=0.1`) for edge-preserving skin smoothing.
+sigmaR fixed at 0.1 keeps eyes / lips / eyebrows crisp while pores even
+out. Captured here because the previous recipe lived only in shell
+history and was nearly lost.
+
 **Re-ingest annuity_docs into chroma_db:**
 ```
 source venv/bin/activate

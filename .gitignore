@@ -22,6 +22,19 @@ annuity_docs/
 # Podcast pipeline — downloaded MP3s and the dedup manifest
 podcast_audio/
 
+# Per-user memory — client conversation digests + profiles. NEVER commit.
+users/
+
+# Access logs — IP addresses are personal data. Keep them local; archive
+# manually if needed for audit. Rotated by RotatingFileHandler.
+logs/
+
+# Deliverables folders produced by the transcript-to-deliverables skill —
+# generated artifacts (transcripts + summaries + .pptx), not source.
+natebjones/
+moonshots/
+deliverables/
+
 # Training / source videos — large, personal
 *.MOV
 *.mov

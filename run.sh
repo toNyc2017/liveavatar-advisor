@@ -14,4 +14,9 @@ pip install -q --upgrade pip
 pip install -q -r requirements.txt
 
 echo "→ starting on http://localhost:8000"
-exec uvicorn advisor_backend:app --host 0.0.0.0 --port 8000 --reload
+# --proxy-headers + --forwarded-allow-ips so X-Forwarded-For / X-Real-IP
+# from ngrok (and any reverse proxy in front of us later) are honored,
+# making the access log show real client IPs instead of the proxy egress.
+exec uvicorn advisor_backend:app \
+    --host 0.0.0.0 --port 8000 --reload \
+    --proxy-headers --forwarded-allow-ips='*'

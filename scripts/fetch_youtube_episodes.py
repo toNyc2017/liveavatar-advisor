@@ -319,6 +319,10 @@ def main() -> None:
                              "the existing ingest.py picks them up).")
     parser.add_argument("--filename-prefix", default="stan_youtube_",
                         help="Prefix applied to transcript filenames.")
+    parser.add_argument("--no-date", action="store_true",
+                        help="Omit publication date from the transcript filename. "
+                             "By default the filename is <prefix><YYYY-MM-DD>_<slug>.txt "
+                             "so episodes sort chronologically when stored together.")
     parser.add_argument("--delete-audio", action="store_true",
                         help="Delete audio files after successful transcription.")
     parser.add_argument("--manifest", default=None,
@@ -327,8 +331,8 @@ def main() -> None:
                         help="Ignore the manifest and re-process every video.")
     args = parser.parse_args()
 
-    audio_dir = Path(args.audio_dir).expanduser()
-    transcript_dir = Path(args.transcript_dir).expanduser()
+    audio_dir = Path(args.audio_dir).expanduser().resolve()
+    transcript_dir = Path(args.transcript_dir).expanduser().resolve()
     audio_dir.mkdir(parents=True, exist_ok=True)
     transcript_dir.mkdir(parents=True, exist_ok=True)
 
@@ -391,7 +395,9 @@ def main() -> None:
         if published and len(published) == 8:
             published = f"{published[:4]}-{published[4:6]}-{published[6:8]}"
 
-        txt_path = transcript_dir / f"{args.filename_prefix}{slug}.txt"
+        # Date prefix in the filename keeps multi-episode folders sortable.
+        date_part = f"{published}_" if (published and not args.no_date) else ""
+        txt_path = transcript_dir / f"{args.filename_prefix}{date_part}{slug}.txt"
         if txt_path.exists() and not args.force:
             print(f"    transcript file already on disk → recording in manifest")
             manifest[vid] = {

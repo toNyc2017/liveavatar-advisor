@@ -19,16 +19,24 @@ the official SDK on the frontend. See HANDOFF.md for what to flesh out next.
 
 import os
 import asyncio
+import json
 import logging
+import time
+import uuid
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import httpx
 import chromadb
 from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from openai import AsyncOpenAI
+import base64
+import re
 from elevenlabs import ElevenLabs
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -46,6 +54,77 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---- access logging --------------------------------------------------------
+#
+# Per-request JSON line written to logs/access.jsonl for audit purposes.
+# Captures: timestamp (UTC), client IP (X-Forwarded-For aware so ngrok-
+# forwarded callers show up correctly), user_id from the cookie if any,
+# method, path, response status, elapsed milliseconds.
+#
+# The rotating handler caps total log volume at 10MB × 5 files ≈ 50MB.
+# At ~250 bytes/line that's roughly 200,000 requests retained. For a
+# real-product retention policy this is the spot to swap in TimedRotating
+# + an S3 ship-and-purge cron.
+#
+# NOTE: for streaming endpoints (/api/converse-stream) elapsed_ms measures
+# time-to-first-byte (when the StreamingResponse object is returned), not
+# the full streaming duration. Treat it as latency-to-start, not latency-
+# to-end, for those routes.
+
+_LOG_DIR = Path(__file__).parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+
+_access_log = logging.getLogger("liveavatar.access")
+_access_log.setLevel(logging.INFO)
+_access_log.propagate = False  # don't double-emit through the root logger / stdout
+_access_handler = RotatingFileHandler(
+    str(_LOG_DIR / "access.jsonl"),
+    maxBytes=10 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8",
+)
+_access_handler.setFormatter(logging.Formatter("%(message)s"))  # message IS the JSON line
+_access_log.addHandler(_access_handler)
+
+
+def _client_ip(request: Request) -> str:
+    """Resolve the real client IP, honoring X-Forwarded-For when present.
+
+    ngrok, AWS ALB, Cloudflare and most reverse proxies add X-Forwarded-For
+    with the original client IP as the first comma-separated value. Without
+    this resolution the IP would always be the proxy's egress address (for
+    ngrok specifically that's whichever tunnel server you connected to)."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip", "")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def access_log_middleware(request: Request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+    # USER_COOKIE_NAME is resolved at request time (module-level constant
+    # defined below in the config section — Python's lazy name lookup).
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "ip": _client_ip(request),
+        "user_id": request.cookies.get(USER_COOKIE_NAME, "-"),
+        "method": request.method,
+        "path": request.url.path,
+        "status": response.status_code,
+        "elapsed_ms": elapsed_ms,
+        "ua": (request.headers.get("user-agent") or "")[:120],
+    }
+    _access_log.info(json.dumps(entry, ensure_ascii=False))
+    return response
+
 
 # ---- config ----------------------------------------------------------------
 
@@ -68,6 +147,11 @@ CHROMA_PATH = os.path.join(_HERE, "chroma_db")
 CHROMA_COLLECTION = "annuity_docs"
 RAG_K = 4
 
+# Per-user memory (see MEMORY_SUBSYSTEM.md for the full design).
+USER_COOKIE_NAME = "liveavatar_user"
+USER_COOKIE_MAX_AGE = 60 * 60 * 24 * 365  # 1 year
+USERS_DIR = Path(_HERE) / "users"
+
 SYSTEM_PROMPT = """You are Tom Olds, a financial professional specializing in retirement planning
 and annuities. You are having a one-on-one conversation with someone who came to YOU specifically
 for guidance. They are not looking for a referral — they want your insight.
@@ -83,6 +167,70 @@ for guidance. They are not looking for a referral — they want your insight.
 - Keep replies short: 2–4 sentences, ~40 words. The avatar will speak this aloud.
 - Don't use lists, headers, or markdown — just clean spoken prose.
 
+APPROACH (this matters more than any other instruction in this prompt — the
+full reasoning is in SOUL.md at the project root):
+
+Your role is a future retirement guide, NOT a product explainer. The annuity
+product is the answer to a question the client hasn't fully posed yet. Your
+job is to help them pose the question — to see what their actual retirement
+is going to look like — before you bring product to the table.
+
+DISCOVERY BEFORE PRODUCT. Before quoting a SPIA, recommending any income
+strategy, or firing the calculator tool, gather the foundational facts of
+their retirement picture. Not as an intake form — naturally, across two or
+three conversational turns, guided by what they volunteer.
+
+The minimum set you need for a meaningful income-gap analysis:
+- Current age and target retirement age
+- Approximate current retirement savings, and what kinds of accounts
+- Expected Social Security at their planned claim age
+- Pension income (if any) and when it would begin
+- Monthly spending they want to maintain in retirement
+- Partner / spouse situation
+- The specific concern that brought them in
+
+When the client asks "how much income would I get from an annuity?", do NOT
+immediately fire the calculator. Anchor first: something like, "Before I
+quote that for you, give me a feel for the picture you're trying to fill in.
+What does the rest of your retirement income look like?" Then, once you
+understand the gap they're trying to fill, the calculator becomes the moment
+of revelation: "Here's what that premium fills in. Notice how it changes
+the picture."
+
+THE FIVE RISKS OF RETIREMENT — weave these into the conversation as plain-
+English realities when the topic invites them. Never recite them as a list.
+Name the risk, then make it personal:
+
+- LONGEVITY RISK — outliving your money. Surface when family longevity,
+  health, or "what if I live to 95" come up.
+- MARKET RISK — stocks and bonds dropping right when you need to draw on
+  them. Surface around allocation conversations or recent downturns.
+- SEQUENCE-OF-RETURNS RISK — a bad market year EARLY in retirement does far
+  more damage than the same year late. Counterintuitive; worth explaining
+  in plain language when timing matters.
+- INFLATION RISK — a fixed income getting less valuable as costs rise over
+  a 20-30 year horizon.
+- LONG-TERM CARE RISK — the cost of care in the 80s overwhelming the rest
+  of the plan. Surface when aging parents or "what happens if I get sick
+  later" come up.
+
+ALWAYS FRAME IN CONTRAST. The most powerful move you can make is the
+without/with framing: "Without guaranteed income, this is what happens.
+With guaranteed income, this is what changes." Reach for this whenever a
+client raises a concern. Examples:
+- "What if the market drops?" → without: your withdrawal rate has to drop
+  with it. With: this portion of your spending floor doesn't move.
+- "What if I live longer than I plan?" → without: you're managing a finite
+  pile against an indefinite horizon. With: this portion is by definition
+  for-life.
+- "What if I get sick later?" → without: care costs come out of the same
+  pile you're spending on everything else. With: your essential expenses
+  stay protected.
+
+The product recommendation is significantly more intuitive once the client
+emotionally sees the income gap and sees how guaranteed income changes the
+outcome. Your job is to help them see it.
+
 PRONUNCIATION (your replies are read aloud by a text-to-speech engine; write
 financial terms the way they SOUND, not the way they're written on paper):
 - "401(k)" — write it as "four oh one K" (NOT "four hundred and one K", NOT "four-zero-one-K"). This is non-negotiable; saying it wrong sounds wrong to anyone in the industry.
@@ -96,7 +244,21 @@ financial terms the way they SOUND, not the way they're written on paper):
 - Dollar amounts: write "two hundred fifty thousand dollars" rather than "$250,000" when speaking the number naturally is clearer; for short / round figures "$250K" → "250 thousand" reads cleanly.
 - Percent: write "five percent" rather than "5%".
 
-If a user asks about a 401(k) rollover, write the term as "four oh one K rollover" in your response. The visible transcript will show "four oh one K" too, which is fine — it matches how a human advisor speaks."""
+If a user asks about a 401(k) rollover, write the term as "four oh one K rollover" in your response. The visible transcript will show "four oh one K" too, which is fine — it matches how a human advisor speaks.
+
+APP CAPABILITIES (things this application can actually do — don't disclaim them):
+- When you call the annuity calculator, the app automatically renders a structured
+  results panel on screen with all the numbers AND three download buttons (PDF, plain
+  text, and JSON). The user can click any of those buttons to download the estimate
+  to their computer. Do NOT tell the user "I can't generate a file" or "I can't create
+  a download." The app does it for them — your only job is to mention they can use
+  the download buttons on the on-screen estimate panel if they want a saved copy.
+- Example response when asked "can I save this?" or "can you send me a PDF?":
+  "Yes — there are three download buttons on the estimate panel right there on
+  your screen. Click PDF for a printable version, or TXT or JSON if you want
+  the raw numbers."
+- If the user wants to share with a spouse or advisor, point them at the same
+  download buttons rather than promising to email or transmit anything yourself."""
 
 aclient = AsyncOpenAI()  # uses OPENAI_API_KEY from env
 
@@ -143,6 +305,297 @@ async def retrieve_context(query: str) -> str:
     except Exception:
         log.exception("RAG retrieval failed — answering without context")
         return ""
+
+
+# ---- per-user memory -------------------------------------------------------
+#
+# Phase 1 of the memory subsystem (see MEMORY_SUBSYSTEM.md). Identity is a
+# UUID cookie set on first visit to '/'. Each visitor has a folder:
+#
+#   users/<user_id>/
+#       USER.md          ← canonical profile (durable facts)
+#       memory/*.md      ← raw session digests, one per conversation
+#       MEMORY.md        ← compiled wiki, regenerated by the compiler script
+#
+# On every LLM call, USER.md + MEMORY.md are prepended to the system prompt.
+# At session end (/api/forget), an async digest writes a new memory/*.md.
+
+def _user_id(request: Request) -> str:
+    """Return the visitor's stable id from the cookie. Falls back to a
+    one-shot 'anon-' id when the cookie is absent — e.g. a direct API call
+    that didn't load '/' first. anon- conversations are not persisted."""
+    return request.cookies.get(USER_COOKIE_NAME) or f"anon-{uuid.uuid4()}"
+
+
+_FIRST_VISIT_INSTRUCTION = """
+
+--- FIRST VISIT ---
+This is a new visitor — you have never spoken with them before, and
+there is no profile or memory on file yet.
+
+Open with a brief warm hello (one or two sentences), ask what they'd
+like to be called, and let the rest of the conversation flow into
+whatever brought them to you. Do NOT ask a chain of intake questions
+— people came for a conversation, not a form.
+
+As soon as they tell you a name (or any preferred form of address),
+call the `save_client_profile` tool with that name in the same turn
+that you greet them back. Examples:
+  Client: "I'm Sarah."
+  You:    [tool: save_client_profile(name="Sarah")] "Lovely to meet
+          you, Sarah. What brings you in today?"
+  Client: "Just call me Mike."
+  You:    [tool: save_client_profile(name="Mike")] "Good to know you,
+          Mike. What's on your mind?"
+
+Do not call the tool until they tell you a name. If they share other
+durable facts in passing (their age, that they have a spouse named X,
+their target retirement year), include those as a short `notes` field
+on the same tool call — but do not interrogate for them; only capture
+what they volunteer.
+--- END FIRST VISIT ---
+"""
+
+
+def load_user_context(user_id: str) -> str:
+    """Read users/<user_id>/USER.md + MEMORY.md and return as a delimited
+    block ready to append to SYSTEM_PROMPT. For first-time visitors
+    (no folder yet, or folder with neither file), returns the FIRST
+    VISIT instruction block telling the avatar to greet and capture
+    their name via the save_client_profile tool."""
+    user_dir = USERS_DIR / user_id
+    parts: list[str] = []
+
+    if user_dir.exists():
+        user_md = user_dir / "USER.md"
+        memory_md = user_dir / "MEMORY.md"
+        if user_md.exists():
+            body = user_md.read_text(encoding="utf-8").strip()
+            if body:
+                parts.append("[About this person — durable facts]\n" + body)
+        if memory_md.exists():
+            body = memory_md.read_text(encoding="utf-8").strip()
+            if body:
+                parts.append("[Compiled memory from past conversations]\n" + body)
+
+    if not parts:
+        # First-time visitor — instruct the avatar to introduce itself
+        # and capture the name via the tool.
+        return _FIRST_VISIT_INSTRUCTION
+
+    return (
+        "\n\n--- CLIENT CONTEXT ---\n"
+        "The following is what you already know about the person you are "
+        "speaking with. Use it naturally — don't quote it back verbatim, "
+        "and don't say 'according to my notes.' Speak as someone who "
+        "remembers them.\n\n"
+        + "\n\n".join(parts)
+        + "\n--- END CLIENT CONTEXT ---\n"
+    )
+
+
+_DIGEST_SYSTEM = """You are summarizing a single conversation between a
+financial advisor (Tom Olds) and a client. Output a markdown file with
+exactly these sections:
+
+# Session <WHEN>
+
+## Context
+2-3 sentences. What did this conversation focus on?
+
+## What the client shared
+Bullet list. Facts about the client we learned: age, accounts, family,
+goals, concerns, preferences. Only what they actually said. Do not
+invent.
+
+## Decisions and answers
+Bullet list. Specific recommendations made or questions answered.
+
+## Open questions
+Bullet list. Things to follow up on next time, or facts we still need.
+
+Constraints:
+- Plain markdown. No emojis. No headings beyond ##.
+- Concise. The whole file should be under 400 words.
+- Voice: declarative third-person. NEVER write 'the client mentioned'
+  or 'the advisor explained.' State the fact directly.
+- If a section has nothing to capture, write the heading and 'None this session.'
+"""
+
+
+async def save_session_digest(user_id: str, turns: list[dict]) -> None:
+    """Digest the conversation with an LLM call and write the result to
+    users/<user_id>/memory/<timestamp>.md. Skips anonymous users and
+    empty conversations. Designed to be fire-and-forget via
+    asyncio.create_task so the user's tab-close isn't blocked on the
+    LLM call."""
+    if not turns or user_id.startswith("anon-"):
+        return
+
+    user_dir = USERS_DIR / user_id / "memory"
+    user_dir.mkdir(parents=True, exist_ok=True)
+
+    transcript = "\n".join(
+        f"{t['role'].upper()}: {t['content']}"
+        for t in turns
+        if t.get("content")
+    )
+    now = datetime.now()
+    when = now.strftime("%Y-%m-%d %H:%M")
+
+    messages = [
+        {"role": "system", "content": _DIGEST_SYSTEM.replace("<WHEN>", when)},
+        {"role": "user", "content": f"Transcript:\n\n{transcript}"},
+    ]
+
+    try:
+        completion = await aclient.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=0.2,
+        )
+        digest = (completion.choices[0].message.content or "").strip()
+    except Exception:
+        log.exception("Failed to generate session digest for %s", user_id)
+        return
+
+    if not digest:
+        return
+
+    filename = now.strftime("%Y-%m-%d_%H-%M.md")
+    path = user_dir / filename
+    path.write_text(digest + "\n", encoding="utf-8")
+    log.info("Saved session digest for %s → %s", user_id, path)
+
+    # Chain in a compile pass so the NEXT session inherits this digest's
+    # specifics via MEMORY.md. load_user_context reads USER.md +
+    # MEMORY.md (not the raw digests), so without this chain a first-
+    # time visitor's session 2 would only see USER.md and miss the
+    # detailed context from their session 1 conversation.
+    await compile_user_memory(user_id)
+
+
+async def compile_user_memory(user_id: str) -> bool:
+    """Synthesize users/<user_id>/memory/*.md into users/<user_id>/MEMORY.md
+    using an LLM pass — async version of scripts/compile_memory.py's
+    compile_user(). Chained from save_session_digest after each session
+    ends so the next session has the prior conversation's specifics
+    available.
+
+    Returns True if MEMORY.md was written, False otherwise (no digests,
+    anonymous user, or LLM call failed). Safe to call standalone."""
+    if not user_id or user_id.startswith("anon-"):
+        return False
+
+    # Reuse the prompt + read/truncate helpers from the CLI compiler so
+    # this and `python scripts/compile_memory.py` produce identical files.
+    import sys as _sys
+    _scripts_dir = os.path.join(_HERE, "scripts")
+    if _scripts_dir not in _sys.path:
+        _sys.path.insert(0, _scripts_dir)
+    try:
+        from compile_memory import (  # type: ignore
+            _SYNTHESIS_PROMPT,
+            _HEADER,
+            MAX_INPUT_CHARS,
+            _read_digests,
+            _truncate,
+        )
+    except Exception:
+        log.exception("Could not import compile_memory helpers; "
+                      "MEMORY.md will not be refreshed for %s", user_id)
+        return False
+
+    user_dir = USERS_DIR / user_id
+    paths, raw = _read_digests(user_dir)
+    if not raw:
+        return False
+
+    raw = _truncate(raw, MAX_INPUT_CHARS)
+
+    try:
+        completion = await aclient.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": _SYNTHESIS_PROMPT},
+                {"role": "user", "content": raw},
+            ],
+            temperature=0.2,
+        )
+        body = (completion.choices[0].message.content or "").strip()
+    except Exception:
+        log.exception("Compile-memory LLM call failed for %s", user_id)
+        return False
+
+    if not body:
+        log.warning("Compile-memory returned empty body for %s", user_id)
+        return False
+
+    when = datetime.now().strftime("%Y-%m-%d %H:%M")
+    n = len(paths)
+    header = _HEADER + (
+        f"<!-- Generated {when} from {n} session "
+        f"digest{'s' if n != 1 else ''} (auto-compiled by backend). -->\n\n"
+    )
+    out_path = user_dir / "MEMORY.md"
+    out_path.write_text(header + body + "\n", encoding="utf-8")
+    log.info("Auto-compiled MEMORY.md for %s (%d digests → %s)",
+             user_id, n, out_path)
+    return True
+
+
+def save_user_profile(user_id: str, name: str, notes: str | None = None) -> dict:
+    """Create or update users/<user_id>/USER.md with the captured name +
+    optional notes. Called by the save_client_profile LLM tool when a
+    client first introduces themselves.
+
+    USER.md is the hand-curatable durable layer; on subsequent sessions
+    load_user_context() reads it back into the system prompt. The
+    compiled MEMORY.md is regenerated from session digests on a separate
+    cadence — this file is the part the client (or Tom) can edit by
+    hand.
+
+    Idempotent — repeated calls overwrite. The LLM is told to call this
+    only on first introduction or explicit correction, not every turn."""
+    if not name or not name.strip():
+        return {"saved": False, "reason": "missing_name"}
+    if not user_id or user_id.startswith("anon-"):
+        # Anonymous (direct API call) — no folder to write to.
+        return {"saved": False, "reason": "anonymous_user"}
+
+    user_dir = USERS_DIR / user_id
+    user_dir.mkdir(parents=True, exist_ok=True)
+    user_md = user_dir / "USER.md"
+
+    name = name.strip()
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # Preserve the original first-met date if USER.md already exists;
+    # only the name + notes update on rewrites.
+    first_met = today
+    if user_md.exists():
+        try:
+            existing = user_md.read_text(encoding="utf-8")
+            for line in existing.splitlines():
+                if line.strip().startswith("- **First met:**"):
+                    first_met = line.split("**First met:**", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+
+    body = (
+        f"# Client profile\n\n"
+        f"- **Name:** {name}\n"
+        f"- **What to call them:** {name}\n"
+        f"- **First met:** {first_met}\n"
+        f"- **Last updated:** {today}\n"
+    )
+    if notes and notes.strip():
+        body += f"\n## Notes\n\n{notes.strip()}\n"
+
+    user_md.write_text(body, encoding="utf-8")
+    log.info("Saved profile for %s (name=%r)", user_id, name)
+    return {"saved": True, "name": name}
 
 
 # ---- request/response models -----------------------------------------------
@@ -294,11 +747,57 @@ LLM_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_client_profile",
+            "description": (
+                "Save or update the durable profile facts for the client you "
+                "are speaking with — primarily their preferred name. Call "
+                "this in EXACTLY two situations: (1) the first time a client "
+                "tells you what to call them, or (2) when an existing client "
+                "explicitly corrects you ('actually, call me Tom'). Do NOT "
+                "call this on every turn. Do NOT call this for facts other "
+                "than name + optional short notes — other durable facts are "
+                "captured by the per-session memory layer automatically."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "The preferred name to use when addressing the "
+                            "client. Just the first name or whatever they "
+                            "said to call them — not a full formal name "
+                            "unless that's what they offered."
+                        ),
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": (
+                            "Optional: a short markdown bullet list of any "
+                            "additional durable facts they volunteered in "
+                            "their introduction (age, spouse, retirement "
+                            "target year, etc.). Keep under 200 words. Do "
+                            "NOT include speculation or anything they "
+                            "didn't explicitly say."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 
-def _run_tool(name: str, args: dict) -> dict:
-    """Execute a tool call by name. Returns the tool's result as a dict."""
+def _run_tool(name: str, args: dict, *, user_id: str | None = None) -> dict:
+    """Execute a tool call by name. Returns the tool's result as a dict.
+
+    The optional user_id is passed through so tools that need to persist
+    something on behalf of the visitor (save_client_profile) can do so.
+    """
     if name == "calculate_spia":
         # Lazy-import the calculator (same approach as the /api/calculate_spia endpoint)
         import sys as _sys
@@ -315,11 +814,17 @@ def _run_tool(name: str, args: dict) -> dict:
             )
         except (ValueError, KeyError, TypeError) as e:
             return {"error": f"Could not run calculator: {e}"}
+    if name == "save_client_profile":
+        return save_user_profile(
+            user_id or "",
+            name=str(args.get("name") or "").strip(),
+            notes=(args.get("notes") or None),
+        )
     return {"error": f"Unknown tool: {name}"}
 
 
 @app.post("/api/llm")
-async def llm(req: LlmReq):
+async def llm(req: LlmReq, request: Request):
     """
     Run the annuity-advisor system prompt against the LLM with rolling memory.
 
@@ -331,10 +836,11 @@ async def llm(req: LlmReq):
     The frontend uses `reply` for TTS and `calculator_result` to render a
     formatted panel + download button.
     """
+    user_id = _user_id(request)
     history = _history.setdefault(req.session_id, [])
 
     context = await retrieve_context(req.user_text)
-    system = SYSTEM_PROMPT
+    system = SYSTEM_PROMPT + load_user_context(user_id)
     if context:
         system += (
             "\n\nRelevant excerpts from annuity documents "
@@ -389,7 +895,7 @@ async def llm(req: LlmReq):
                 args = _json.loads(tc.function.arguments or "{}")
             except _json.JSONDecodeError:
                 args = {}
-            tool_output = _run_tool(tc.function.name, args)
+            tool_output = _run_tool(tc.function.name, args, user_id=user_id)
             if tc.function.name == "calculate_spia" and "error" not in tool_output:
                 calculator_result = tool_output
             messages.append({
@@ -446,6 +952,350 @@ def tts(req: TtsReq):
     return Response(content=audio_bytes, media_type="application/octet-stream")
 
 
+# ---- Streaming pipeline (LLM → sentence → TTS → SSE) ----------------------
+#
+# The slow path was: full LLM completion → full ElevenLabs synthesis → forward
+# full PCM to browser → browser chunks and feeds avatar. ~3-5s perceived gap.
+#
+# Streaming path: as soon as a complete sentence is generated by the LLM, we
+# call ElevenLabs streaming TTS for that sentence and forward the PCM bytes
+# to the browser via Server-Sent Events. The browser feeds chunks to the
+# avatar as they arrive, so the avatar starts speaking the first sentence
+# while the LLM is still generating the second. ~1-1.5s perceived gap.
+
+# Common abbreviations that end with a period but DON'T end a sentence.
+_SENTENCE_ABBREVIATIONS = {
+    "Mr", "Mrs", "Ms", "Dr", "St", "Jr", "Sr",
+    "Inc", "Co", "Corp", "Ltd",
+    "etc", "vs", "approx",
+    "e.g", "i.e", "U.S", "U.K", "U.S.A",
+    "Jan", "Feb", "Mar", "Apr", "Jun", "Jul", "Aug", "Sep", "Sept", "Oct", "Nov", "Dec",
+}
+
+_SENTENCE_RE = re.compile(r"([.!?])(\s+|$)")
+
+
+def _extract_complete_sentence(text: str) -> tuple[str, str]:
+    """Return (sentence, remainder). If no complete sentence, returns ('', text).
+
+    Handles common abbreviations so 'Mr. Smith' doesn't end a sentence after 'Mr.'
+    Also avoids splitting on a period that immediately follows a digit (defensive
+    against numeric content like '$1,000.50' — though the system prompt asks the
+    LLM to write spoken-form numbers, this catches edge cases).
+    """
+    for match in _SENTENCE_RE.finditer(text):
+        end_idx = match.start()
+        # Look backward for the word ending here
+        word_match = re.search(r"(\w+)$", text[:end_idx])
+        if word_match and word_match.group(1) in _SENTENCE_ABBREVIATIONS:
+            continue
+        # Skip period after a digit (e.g. "$1,000.")
+        if end_idx > 0 and text[end_idx - 1].isdigit() and text[end_idx] == ".":
+            continue
+        return text[: end_idx + 1].strip(), text[match.end():]
+    return "", text
+
+
+def _stream_tts_bytes(text: str):
+    """Generator yielding PCM bytes from ElevenLabs Flash for a single sentence."""
+    if not ELEVENLABS_API_KEY or not text.strip():
+        return
+    client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+    audio_gen = client.text_to_speech.convert(
+        voice_id=ELEVENLABS_VOICE_ID,
+        text=text,
+        model_id="eleven_flash_v2_5",
+        output_format="pcm_24000",
+    )
+    for chunk in audio_gen:
+        if chunk:
+            yield chunk
+
+
+def _calculator_response_template(result: dict) -> str:
+    """Generate a natural-language response from a calculator result. Used
+    instead of a second LLM call to save ~1-2s per calculator turn. Phrasing
+    follows the system prompt's pronunciation rules (spoken-form numbers,
+    'percent' instead of '%')."""
+    monthly = result["monthly_income"]
+    annual = result["annual_income"]
+    rate = result["payout_rate_pct"]
+    age = result["age"]
+    gender = result["gender"]
+    premium = result["premium"]
+    # Short label for spoken use
+    label = result["payout_type_label"].split(" — ")[0].split(" (")[0]
+    # Words for the premium amount
+    if premium >= 1_000_000:
+        premium_word = f"{premium / 1_000_000:.1f} million dollars".replace(".0 ", " ")
+    elif premium >= 1000:
+        premium_word = f"{int(premium / 1000)} thousand dollars"
+    else:
+        premium_word = f"{int(premium)} dollars"
+
+    parts = [
+        f"With {premium_word} at age {age}, {label.lower()}, "
+        f"you'd be looking at about {int(monthly):,} dollars a month — "
+        f"that's {int(annual):,} a year, a {rate:.1f} percent rate."
+    ]
+    if result.get("guaranteed_years"):
+        parts.append(
+            f" And you'd be guaranteed payments for the first "
+            f"{result['guaranteed_years']} years even if something happened to you early."
+        )
+    elif result.get("guaranteed_total"):
+        parts.append(
+            " And the cash refund means any unused premium comes back to your beneficiary at death."
+        )
+    else:
+        parts.append(
+            f" Over your statistical life expectancy of "
+            f"{int(result['life_expectancy_years'])} years, that totals around "
+            f"{int(result['estimated_lifetime_income']):,} dollars."
+        )
+    return "".join(parts)
+
+
+def _sse(data: dict) -> str:
+    """Format a dict as a Server-Sent Events frame."""
+    return f"data: {_json.dumps(data)}\n\n"
+
+
+@app.post("/api/converse-stream")
+async def converse_stream(req: LlmReq, request: Request):
+    """
+    Streaming version of /api/llm. Returns text-event-stream events, one per line:
+
+        data: {"type":"text","text":"Hello there."}
+        data: {"type":"audio","b64":"<base64 PCM 24kHz 16-bit mono LE>"}
+        data: {"type":"calculator_result","data":{...}}
+        data: {"type":"done"}
+        data: {"type":"error","message":"..."}
+
+    The frontend dispatches each event type:
+        text             → append to transcript pane
+        audio            → buffer + chunk per LiveAvatar's 400ms-then-1s spec
+                           and send to session.repeatAudio()
+        calculator_result→ render the structured panel
+        done             → flush any final audio chunks, close the stream
+        error            → surface to user
+    """
+    user_id = _user_id(request)
+
+    async def event_stream():
+        try:
+            history = _history.setdefault(req.session_id, [])
+            context = await retrieve_context(req.user_text)
+            system = SYSTEM_PROMPT + load_user_context(user_id)
+            if context:
+                system += (
+                    "\n\nRelevant excerpts from annuity documents "
+                    "(use these to ground your answer — do not cite source filenames aloud):\n\n"
+                    + context
+                )
+            system += (
+                "\n\nYou have a calculator tool available for estimating fixed-income "
+                "annuity payments. Use it when the user asks 'how much income would I get' "
+                "or any similar question that requires a concrete number. If you're missing "
+                "any required input (premium amount, age, gender), ask the user one short "
+                "natural question to get it before calling the tool."
+            )
+
+            messages: list[dict] = [{"role": "system", "content": system}]
+            messages.extend(history[-MAX_TURNS:])
+            messages.append({"role": "user", "content": req.user_text})
+
+            full_reply = ""
+            sentence_buffer = ""
+            tool_call_buffer: dict[int, dict] = {}
+
+            stream = await aclient.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                tools=LLM_TOOLS,
+                tool_choice="auto",
+                temperature=0.6,
+                stream=True,
+            )
+
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                # Accumulate streaming tool-call args
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        slot = tool_call_buffer.setdefault(
+                            idx, {"id": "", "name": "", "args": ""}
+                        )
+                        if tc.id:
+                            slot["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            slot["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            slot["args"] += tc.function.arguments
+
+                # Accumulate streaming text and emit per-sentence
+                if delta.content:
+                    sentence_buffer += delta.content
+                    full_reply += delta.content
+                    while True:
+                        sentence, remainder = _extract_complete_sentence(sentence_buffer)
+                        if not sentence:
+                            break
+                        sentence_buffer = remainder
+                        yield _sse({"type": "text", "text": sentence + " "})
+                        for audio_chunk in _stream_tts_bytes(sentence):
+                            b64 = base64.b64encode(audio_chunk).decode("ascii")
+                            yield _sse({"type": "audio", "b64": b64})
+
+            # Flush any final partial sentence (no trailing punctuation)
+            tail = sentence_buffer.strip()
+            if tail:
+                yield _sse({"type": "text", "text": tail})
+                for audio_chunk in _stream_tts_bytes(tail):
+                    b64 = base64.b64encode(audio_chunk).decode("ascii")
+                    yield _sse({"type": "audio", "b64": b64})
+
+            # Handle tool calls — calculator (renders panel + templated reply)
+            # and save_client_profile (silent side effect; the avatar already
+            # streamed its greeting in the same turn).
+            if tool_call_buffer:
+                for slot in tool_call_buffer.values():
+                    if slot["name"] == "save_client_profile":
+                        try:
+                            args = _json.loads(slot["args"] or "{}")
+                            name_arg = (args.get("name") or "").strip()
+                            # Check whether USER.md already existed BEFORE the
+                            # tool runs. Distinguishes first-introduction
+                            # (no USER.md yet) from explicit-correction
+                            # (USER.md exists, client said "actually call me X")
+                            # so we can pick the right templated greeting if
+                            # the LLM goes silent.
+                            was_first_intro = (
+                                user_id
+                                and not user_id.startswith("anon-")
+                                and not (USERS_DIR / user_id / "USER.md").exists()
+                            )
+                            result = _run_tool(
+                                "save_client_profile", args, user_id=user_id
+                            )
+                            log.info("save_client_profile → %s", result)
+                        except Exception:
+                            log.exception("save_client_profile failed")
+                            result = {"saved": False}
+                            name_arg = ""
+                            was_first_intro = False
+
+                        # Defensive backstop: when the LLM emits a tool call
+                        # without any spoken text in the same turn (the
+                        # silent-tool-call pattern of OpenAI function calling),
+                        # the avatar would otherwise go silent on this turn.
+                        # Stream a short templated acknowledgment so the avatar
+                        # always says SOMETHING when it captures a name.
+                        # Mirrors the calculator's _calculator_response_template
+                        # pattern. Only fires when:
+                        #   1. The save succeeded (real client, real name)
+                        #   2. The LLM produced no spoken text alongside it
+                        #   3. We captured a name to address them by
+                        if (
+                            result.get("saved")
+                            and not full_reply.strip()
+                            and name_arg
+                        ):
+                            if was_first_intro:
+                                spoken = (
+                                    f"Got it, {name_arg} — welcome. "
+                                    f"What's on your mind today?"
+                                )
+                            else:
+                                spoken = f"Got it — I'll call you {name_arg} from here."
+                            log.info(
+                                "save_client_profile fired silently — emitting "
+                                "templated greeting (%d chars) so the avatar "
+                                "doesn't go silent",
+                                len(spoken),
+                            )
+                            full_reply = spoken
+                            buffer = spoken
+                            while True:
+                                sentence, remainder = _extract_complete_sentence(buffer)
+                                if not sentence:
+                                    break
+                                buffer = remainder
+                                yield _sse({"type": "text", "text": sentence + " "})
+                                for audio_chunk in _stream_tts_bytes(sentence):
+                                    b64 = base64.b64encode(audio_chunk).decode("ascii")
+                                    yield _sse({"type": "audio", "b64": b64})
+                            if buffer.strip():
+                                yield _sse({"type": "text", "text": buffer})
+                                for audio_chunk in _stream_tts_bytes(buffer):
+                                    b64 = base64.b64encode(audio_chunk).decode("ascii")
+                                    yield _sse({"type": "audio", "b64": b64})
+                        continue
+
+                    if slot["name"] != "calculate_spia":
+                        continue
+                    try:
+                        args = _json.loads(slot["args"] or "{}")
+                        result = _run_tool("calculate_spia", args, user_id=user_id)
+                    except Exception as e:
+                        log.exception("tool exec failed")
+                        result = {"error": str(e)}
+
+                    if "error" in result:
+                        # Stream a brief error message
+                        msg = "Hmm, I couldn't run that calculation. Could you give me the premium amount, your age, and gender once more?"
+                        yield _sse({"type": "text", "text": msg})
+                        for audio_chunk in _stream_tts_bytes(msg):
+                            b64 = base64.b64encode(audio_chunk).decode("ascii")
+                            yield _sse({"type": "audio", "b64": b64})
+                        full_reply = msg
+                    else:
+                        # Render the panel for the user
+                        yield _sse({"type": "calculator_result", "data": result})
+                        # Use the templated response (no second LLM call)
+                        spoken = _calculator_response_template(result)
+                        full_reply = spoken
+                        # Stream sentence-by-sentence through TTS
+                        buffer = spoken
+                        while True:
+                            sentence, remainder = _extract_complete_sentence(buffer)
+                            if not sentence:
+                                break
+                            buffer = remainder
+                            yield _sse({"type": "text", "text": sentence + " "})
+                            for audio_chunk in _stream_tts_bytes(sentence):
+                                b64 = base64.b64encode(audio_chunk).decode("ascii")
+                                yield _sse({"type": "audio", "b64": b64})
+                        # Final tail
+                        if buffer.strip():
+                            yield _sse({"type": "text", "text": buffer})
+                            for audio_chunk in _stream_tts_bytes(buffer):
+                                b64 = base64.b64encode(audio_chunk).decode("ascii")
+                                yield _sse({"type": "audio", "b64": b64})
+
+            if full_reply.strip():
+                history.append({"role": "user", "content": req.user_text})
+                history.append({"role": "assistant", "content": full_reply.strip()})
+
+            yield _sse({"type": "done"})
+        except Exception as e:
+            log.exception("converse-stream error")
+            yield _sse({"type": "error", "message": str(e)})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable proxy buffering
+        },
+    )
+
+
 @app.post("/api/calculate_spia")
 async def calculate_spia_endpoint(req: SpiaReq):
     """
@@ -479,16 +1329,40 @@ async def calculate_spia_endpoint(req: SpiaReq):
 
 
 @app.post("/api/forget")
-async def forget(payload: dict):
-    """Clear the in-memory transcript when a session ends."""
+async def forget(payload: dict, request: Request):
+    """Save a digest of the conversation, then clear the in-memory transcript.
+
+    The digest call is fire-and-forget via asyncio.create_task so the tab-close
+    on the client isn't blocked. If uvicorn shuts down before the task
+    completes the digest is simply not written — no half-files because
+    Path.write_text is atomic at the OS level.
+    """
     sid = payload.get("session_id")
     if sid:
+        turns = list(_history.get(sid, []))  # copy so the pop doesn't race the task
+        user_id = _user_id(request)
+        if turns:
+            asyncio.create_task(save_session_digest(user_id, turns))
         _history.pop(sid, None)
     return {"ok": True}
 
 
 # Serve the static frontend from the same origin.
 @app.get("/")
-async def index():
-    here = os.path.dirname(os.path.abspath(__file__))
-    return FileResponse(os.path.join(here, "index.html"))
+async def index(request: Request):
+    """Serve index.html and mint a long-lived user_id cookie on first visit.
+
+    The cookie is the stable identity for the per-user memory layer
+    (see MEMORY_SUBSYSTEM.md). httponly=False so frontend JS can later
+    read it for a 'this is me' / 'view your profile' UX. samesite=lax
+    so an external referral doesn't strip it on the redirect."""
+    response = FileResponse(os.path.join(_HERE, "index.html"))
+    if not request.cookies.get(USER_COOKIE_NAME):
+        response.set_cookie(
+            USER_COOKIE_NAME,
+            str(uuid.uuid4()),
+            max_age=USER_COOKIE_MAX_AGE,
+            httponly=False,
+            samesite="lax",
+        )
+    return response

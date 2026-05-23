@@ -452,47 +452,22 @@ stopBtn.addEventListener("click", async () => {
     setStatus("Disconnected", false);
 });
 
-// ---------- Asking ----------
-async function ask(text) {
-    text = (text || "").trim();
-    if (!text || !session || !sessionId) return;
-    addTurn("user", text);
-    inputEl.value = "";
-    inputEl.disabled = true; askBtn.disabled = true; talkBtn.disabled = true;
-    try {
-        const res = await fetch(`${API}/api/llm`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ session_id: sessionId, user_text: text }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+// ---------- Asking (streaming) ----------
+//
+// Streaming version of the ask flow. Hits /api/converse-stream which yields
+// SSE events (text, audio, calculator_result, done, error) as the LLM and
+// TTS produce them. Audio bytes are buffered until they meet LiveAvatar's
+// chunk-size requirements (400 ms first, then 1 s) and forwarded incrementally
+// to session.repeatAudio() — so the avatar starts speaking the first sentence
+// while the LLM is still generating the rest.
 
-        // If the LLM ran the SPIA calculator, show the structured result panel
-        // BEFORE the avatar starts speaking — viewer sees the numbers while
-        // they hear the conversational summary.
-        if (data.calculator_result) {
-            renderCalculatorResult(data.calculator_result);
-        }
-
-        // Make the avatar lip-sync to ElevenLabs audio via session.repeatAudio().
-        // AVATAR_TRANSCRIPTION_CHUNK doesn't fire for repeatAudio, so we add the
-        // reply text to the transcript ourselves before speech starts.
-        const advisorBody = addTurn("avatar", data.reply);
-        await speakViaElevenLabs(data.reply);
-        // Note: we do NOT addTurn("avatar", data.reply) here, because
-        // AVATAR_TRANSCRIPTION_CHUNK events will stream the spoken transcript
-        // into the UI as the avatar speaks it.
-    } catch (err) {
-        console.error(err);
-        addTurn("avatar", "⚠️ " + err.message);
-    } finally {
-        inputEl.disabled = false; askBtn.disabled = false; talkBtn.disabled = !recognition;
-        inputEl.focus();
-    }
+function b64DecodeToBytes(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
 }
-// ---------- ElevenLabs TTS → avatar lip-sync ----------
-function b64Encode(arrayBuffer) {
-    const bytes = new Uint8Array(arrayBuffer);
+function b64EncodeBytes(bytes) {
     let binary = '';
     const CHUNK = 8192;
     for (let i = 0; i < bytes.byteLength; i += CHUNK) {
@@ -501,26 +476,108 @@ function b64Encode(arrayBuffer) {
     return btoa(binary);
 }
 
-async function speakViaElevenLabs(text) {
-    const res = await fetch(`${API}/api/tts`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
-    });
-    if (!res.ok) throw new Error(`TTS ${res.status}: ${await res.text()}`);
-    const buf = await res.arrayBuffer();
+const PCM_FIRST_CHUNK = 19200;   // 400 ms at 24 kHz, 16-bit mono
+const PCM_REST_CHUNK  = 48000;   // 1 s chunks thereafter
 
-    const FIRST = 19200;   // 400 ms at 24 kHz × 16-bit mono
-    const REST  = 48000;   // 1 s chunks thereafter
+async function ask(text) {
+    text = (text || "").trim();
+    if (!text || !session || !sessionId) return;
+    addTurn("user", text);
+    inputEl.value = "";
+    inputEl.disabled = true; askBtn.disabled = true; talkBtn.disabled = true;
 
-    let offset = 0, first = true;
-    while (offset < buf.byteLength) {
-        const size  = first ? FIRST : REST;
-        const slice = buf.slice(offset, offset + size);
-        offset += size;
-        first = false;
-        session.repeatAudio(b64Encode(slice));
-        await new Promise(r => setTimeout(r, 50));
+    // Per-turn state for the streaming consumer
+    let advisorBody = null;             // grows as text events arrive
+    let pcmBacklog = new Uint8Array(0); // accumulated audio bytes
+    let isFirstChunk = true;             // 400 ms first, then 1 s
+    let chunkSendInProgress = Promise.resolve();
+
+    function appendPcm(bytes) {
+        // Concatenate into the backlog, then drain whatever full chunks are ready.
+        const merged = new Uint8Array(pcmBacklog.length + bytes.length);
+        merged.set(pcmBacklog, 0);
+        merged.set(bytes, pcmBacklog.length);
+        pcmBacklog = merged;
+        drainChunks(false);
+    }
+    function drainChunks(flushAll) {
+        while (true) {
+            const target = isFirstChunk ? PCM_FIRST_CHUNK : PCM_REST_CHUNK;
+            if (pcmBacklog.length < target && !flushAll) return;
+            if (pcmBacklog.length === 0) return;
+            const sliceSize = flushAll ? pcmBacklog.length : target;
+            const slice = pcmBacklog.subarray(0, sliceSize);
+            pcmBacklog = pcmBacklog.subarray(sliceSize);
+            isFirstChunk = false;
+            const b64 = b64EncodeBytes(slice);
+            // Serialize repeatAudio() calls so they don't trample each other
+            chunkSendInProgress = chunkSendInProgress.then(async () => {
+                try { session.repeatAudio(b64); } catch (e) { console.warn("repeatAudio failed", e); }
+                await new Promise(r => setTimeout(r, 30));
+            });
+            if (flushAll && pcmBacklog.length === 0) return;
+        }
+    }
+    function appendText(text) {
+        if (!advisorBody) advisorBody = addTurn("avatar", "");
+        advisorBody.textContent += text;
+        transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    try {
+        const res = await fetch(`${API}/api/converse-stream`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: sessionId, user_text: text }),
+        });
+        if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(`stream ${res.status}: ${errText}`);
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let textBuf = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            textBuf += decoder.decode(value, { stream: true });
+            // SSE frames are separated by blank lines
+            let nlIdx;
+            while ((nlIdx = textBuf.indexOf("\n\n")) !== -1) {
+                const frame = textBuf.slice(0, nlIdx);
+                textBuf = textBuf.slice(nlIdx + 2);
+                // A frame is one or more "data: ..." lines; we only emit one per frame
+                const dataLine = frame.split("\n").find(l => l.startsWith("data:"));
+                if (!dataLine) continue;
+                const payload = dataLine.slice(5).trim();
+                if (!payload) continue;
+                let msg;
+                try { msg = JSON.parse(payload); } catch (e) { console.warn("bad SSE payload", payload); continue; }
+
+                if (msg.type === "text") {
+                    appendText(msg.text || "");
+                } else if (msg.type === "audio") {
+                    if (msg.b64) appendPcm(b64DecodeToBytes(msg.b64));
+                } else if (msg.type === "calculator_result") {
+                    if (msg.data) renderCalculatorResult(msg.data);
+                } else if (msg.type === "error") {
+                    throw new Error(msg.message || "stream error");
+                } else if (msg.type === "done") {
+                    // Drain any remaining audio as a partial final chunk
+                    drainChunks(true);
+                }
+            }
+        }
+        // Wait for in-flight chunk sends to finish
+        await chunkSendInProgress;
+    } catch (err) {
+        console.error(err);
+        if (!advisorBody) advisorBody = addTurn("avatar", "");
+        advisorBody.textContent += "\n⚠️ " + err.message;
+    } finally {
+        inputEl.disabled = false; askBtn.disabled = false; talkBtn.disabled = !recognition;
+        inputEl.focus();
     }
 }
 

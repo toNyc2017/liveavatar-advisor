@@ -26,3 +26,6 @@ requests>=2.31
 
 # YouTube ingestion (scripts/fetch_youtube_episodes.py)
 yt-dlp>=2024.4.9
+
+# Slide deck + email summary generation (skills/transcript-to-deliverables)
+python-pptx>=1.0
