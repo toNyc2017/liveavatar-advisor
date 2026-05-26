@@ -110,8 +110,7 @@
             <button id="ask-btn" disabled>Send</button>
         </div>
         <div class="hint">
-            Hold <kbd>Space</kbd> or click & hold the mic button. Voice input uses the
-            browser's Web Speech API; the avatar's reply uses HeyGen's built-in voice.
+            Press <kbd>Ctrl+M</kbd> or <kbd>Space</kbd> to start/stop recording. Click the mic button or press Enter to send typed text.
         </div>
     </div>
 
@@ -576,7 +575,7 @@ async function ask(text) {
         if (!advisorBody) advisorBody = addTurn("avatar", "");
         advisorBody.textContent += "\n⚠️ " + err.message;
     } finally {
-        inputEl.disabled = false; askBtn.disabled = false; talkBtn.disabled = !recognition;
+        inputEl.disabled = false; askBtn.disabled = false; talkBtn.disabled = !window._micStream;
         inputEl.focus();
     }
 }
@@ -584,59 +583,127 @@ async function ask(text) {
 askBtn.addEventListener("click", () => ask(inputEl.value));
 inputEl.addEventListener("keypress", (e) => { if (e.key === "Enter") ask(inputEl.value); });
 
-// ---------- Push-to-talk (Web Speech API) ----------
-function setupSpeechRecognition() {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) return false;
-    recognition = new SR();
-    recognition.lang = "en-US";
-    recognition.interimResults = true;
-    recognition.continuous = false;
-    recognition.onresult = (ev) => {
-        let combined = "";
-        for (let i = 0; i < ev.results.length; i++) combined += ev.results[i][0].transcript;
-        pendingTranscript = combined.trim();
-        inputEl.value = pendingTranscript;
-    };
-    recognition.onend = () => {
-        recognizing = false;
-        talkBtn.classList.remove("recording");
-        talkBtn.textContent = "🎤 Hold to talk";
-        if (pendingTranscript) { const t = pendingTranscript; pendingTranscript = ""; ask(t); }
-    };
-    recognition.onerror = (e) => {
-        console.warn("speech error", e.error);
-        recognizing = false;
-        talkBtn.classList.remove("recording");
-        talkBtn.textContent = "🎤 Hold to talk";
-    };
-    return true;
-}
-function startTalking() {
-    if (!recognition || recognizing || !session) return;
+// ---------- Mic toggle (Whisper via backend) ----------
+//
+// Toggle mode: one press/key starts recording, another stops and sends.
+// No holding required.
+//
+// Keyboard shortcuts:
+//   Ctrl+M — toggle mic (M = mic; safe on Mac, won't trigger Siri/Dictation)
+//   Space  — toggle mic when the text input is NOT focused
+//
+// Replaces the Web Speech API (Chrome/HTTPS-only, Google-dependent) with
+// MediaRecorder → POST /api/transcribe → Whisper. Works on any URL and
+// any modern browser.
+
+let mediaRecorder = null;
+let audioChunks = [];
+
+async function setupWhisperPTT() {
     try {
-        pendingTranscript = ""; inputEl.value = "";
-        recognition.start();
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        window._micStream = stream;
+        return true;
+    } catch (err) {
+        const msg = err.name === "NotAllowedError"
+            ? "Microphone permission denied — allow mic access and reload."
+            : `Microphone unavailable: ${err.message}`;
+        setStatus(msg, false);
+        console.warn("Mic setup failed:", err);
+        return false;
+    }
+}
+
+function startRecording() {
+    if (recognizing || !session || !window._micStream) return;
+    try {
+        audioChunks = [];
+        mediaRecorder = new MediaRecorder(window._micStream);
+        mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
+        mediaRecorder.start();
         recognizing = true;
         talkBtn.classList.add("recording");
-        talkBtn.textContent = "● Listening…";
-    } catch (e) { console.warn(e); }
-}
-function stopTalking() {
-    if (!recognition || !recognizing) return;
-    try { recognition.stop(); } catch (_) {}
-}
-talkBtn.addEventListener("mousedown", startTalking);
-talkBtn.addEventListener("touchstart", (e) => { e.preventDefault(); startTalking(); });
-document.addEventListener("mouseup", stopTalking);
-document.addEventListener("touchend", stopTalking);
-document.addEventListener("keydown", (e) => {
-    if (e.code === "Space" && document.activeElement !== inputEl && !recognizing && session) {
-        e.preventDefault(); startTalking();
+        talkBtn.textContent = "● Recording — press Ctrl+M to send";
+        inputEl.value = "";
+    } catch (e) {
+        console.warn("startRecording error:", e);
+        setStatus("Could not start recording: " + e.message, false);
     }
-});
-document.addEventListener("keyup", (e) => {
-    if (e.code === "Space" && recognizing) { e.preventDefault(); stopTalking(); }
+}
+
+async function stopRecording() {
+    if (!mediaRecorder || !recognizing) return;
+    recognizing = false;
+    talkBtn.classList.remove("recording");
+    talkBtn.textContent = "⏳ Transcribing…";
+    talkBtn.disabled = true;
+
+    await new Promise((resolve) => {
+        mediaRecorder.onstop = resolve;
+        mediaRecorder.stop();
+    });
+
+    if (audioChunks.length === 0) {
+        talkBtn.textContent = "🎤 Press Ctrl+M to speak";
+        talkBtn.disabled = false;
+        return;
+    }
+
+    const mimeType = mediaRecorder.mimeType || "audio/webm";
+    const blob = new Blob(audioChunks, { type: mimeType });
+    audioChunks = [];
+
+    try {
+        const res = await fetch(`${API}/api/transcribe`, {
+            method: "POST",
+            headers: { "Content-Type": mimeType },
+            body: blob,
+        });
+        const data = await res.json();
+        const text = (data.text || "").trim();
+        if (text) {
+            inputEl.value = text;
+            ask(text);
+        } else {
+            setStatus("Couldn't hear anything — try again.", false);
+        }
+    } catch (err) {
+        console.warn("Transcription fetch failed:", err);
+        setStatus("Transcription failed: " + err.message, false);
+    } finally {
+        talkBtn.textContent = "🎤 Press Ctrl+M to speak";
+        talkBtn.disabled = false;
+    }
+}
+
+function toggleMic() {
+    if (recognizing) stopRecording();
+    else startRecording();
+}
+
+function setupSpeechRecognition() {
+    setupWhisperPTT().then((ok) => {
+        talkBtn.disabled = !ok;
+        if (ok) talkBtn.textContent = "🎤 Press Ctrl+M to speak";
+        else talkBtn.title = "Microphone not available — check browser permissions.";
+    });
+    return true;
+}
+
+// Button click = toggle
+talkBtn.addEventListener("click", (e) => { e.preventDefault(); toggleMic(); });
+
+// Ctrl+M = toggle mic (safe on Mac — won't trigger Siri, Dictation, or VoiceOver)
+// Space  = toggle mic when the text input isn't focused
+document.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.code === "KeyM" && session) {
+        e.preventDefault();
+        toggleMic();
+    }
+    if (e.code === "Space" && document.activeElement !== inputEl && session) {
+        e.preventDefault();
+        toggleMic();
+    }
 });
 </script>
 </body>

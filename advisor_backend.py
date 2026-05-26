@@ -333,20 +333,34 @@ _FIRST_VISIT_INSTRUCTION = """
 This is a new visitor — you have never spoken with them before, and
 there is no profile or memory on file yet.
 
-Open with a brief warm hello (one or two sentences), ask what they'd
-like to be called, and let the rest of the conversation flow into
-whatever brought them to you. Do NOT ask a chain of intake questions
-— people came for a conversation, not a form.
+CRITICAL: Make them feel heard immediately — do NOT make them repeat
+themselves. If their first message contains BOTH a name AND a topic or
+question, engage with the topic right away in the same response. Do
+NOT just ask "what brings you in?" when they already told you.
 
-As soon as they tell you a name (or any preferred form of address),
-call the `save_client_profile` tool with that name in the same turn
-that you greet them back. Examples:
-  Client: "I'm Sarah."
-  You:    [tool: save_client_profile(name="Sarah")] "Lovely to meet
-          you, Sarah. What brings you in today?"
-  Client: "Just call me Mike."
-  You:    [tool: save_client_profile(name="Mike")] "Good to know you,
-          Mike. What's on your mind?"
+If they have NOT given a name yet:
+  Greet them warmly (one sentence), ask what to call them, and
+  let the conversation open naturally. Do NOT ask a chain of intake
+  questions — people came for a conversation, not a form.
+
+If they HAVE given a name (look for "I'm X", "call me X", "it's X",
+  "my name is X"):
+  Call save_client_profile AND address whatever else they said — all
+  in the same response. Examples:
+    Client: "Hi, I'm Sarah."
+    You:    [tool: save_client_profile(name="Sarah")] "Lovely to meet
+            you, Sarah. What brings you in today?"
+    Client: "I'm Mike, I'm wondering if annuities make sense for me."
+    You:    [tool: save_client_profile(name="Mike")] "Good to know you,
+            Mike. Annuities are definitely worth thinking through — let
+            me ask you a few things to see what picture we're dealing
+            with. How far out is retirement for you?"
+    Client: "Just call me Kim — I've been reading about fixed indexed
+            annuities and I'm confused."
+    You:    [tool: save_client_profile(name="Kim")] "Kim, you're in
+            good company — fixed indexed annuities are one of the more
+            misunderstood products out there. What part is tripping you
+            up?"
 
 Do not call the tool until they tell you a name. If they share other
 durable facts in passing (their age, that they have a spouse named X,
@@ -649,7 +663,7 @@ async def get_session_token():
     if not AVATAR_ID:
         raise HTTPException(500, "HEYGEN_AVATAR_ID not set in .env — set it to a LiveAvatar avatar id (preset or your trained custom)")
 
-    body = {"avatar_id": AVATAR_ID, "mode": SESSION_MODE}
+    body = {"avatar_id": AVATAR_ID, "mode": SESSION_MODE, "disable_idle_timeout": True}
     async with httpx.AsyncClient(timeout=30.0) as client:
         res = await client.post(
             f"{LIVEAVATAR_API}/v1/sessions/token",
@@ -1189,17 +1203,92 @@ async def converse_stream(req: LlmReq, request: Request):
                             name_arg = ""
                             was_first_intro = False
 
-                        # Defensive backstop: when the LLM emits a tool call
-                        # without any spoken text in the same turn (the
-                        # silent-tool-call pattern of OpenAI function calling),
-                        # the avatar would otherwise go silent on this turn.
-                        # Stream a short templated acknowledgment so the avatar
-                        # always says SOMETHING when it captures a name.
-                        # Mirrors the calculator's _calculator_response_template
-                        # pattern. Only fires when:
-                        #   1. The save succeeded (real client, real name)
-                        #   2. The LLM produced no spoken text alongside it
-                        #   3. We captured a name to address them by
+                        # Second LLM pass — ensures the user's full first
+                        # message is addressed, not just the name capture.
+                        #
+                        # Problem: the first LLM pass often streams only a
+                        # greeting ("Nice to meet you, Bill!") then calls
+                        # save_client_profile, leaving the user's actual
+                        # question or topic unaddressed. The second pass
+                        # sees the complete exchange (first greeting + tool
+                        # result) and continues naturally, picking up whatever
+                        # the user said that wasn't answered yet.
+                        if result.get("saved") and was_first_intro:
+                            # Reload context — USER.md now exists with the name.
+                            updated_system = SYSTEM_PROMPT + load_user_context(user_id)
+                            if context:
+                                updated_system += (
+                                    "\n\nRelevant excerpts from annuity documents "
+                                    "(use these to ground your answer — do not cite "
+                                    "source filenames aloud):\n\n" + context
+                                )
+                            second_messages: list[dict] = [
+                                {"role": "system", "content": updated_system}
+                            ]
+                            second_messages.extend(history[-MAX_TURNS:])
+                            second_messages.append(
+                                {"role": "user", "content": req.user_text}
+                            )
+                            # Feed back the first pass so the LLM doesn't
+                            # repeat the greeting — it continues from here.
+                            second_messages.append({
+                                "role": "assistant",
+                                "content": full_reply or "",
+                                "tool_calls": [{
+                                    "id": slot["id"],
+                                    "type": "function",
+                                    "function": {
+                                        "name": "save_client_profile",
+                                        "arguments": slot["args"],
+                                    },
+                                }],
+                            })
+                            second_messages.append({
+                                "role": "tool",
+                                "tool_call_id": slot["id"],
+                                "content": _json.dumps(result),
+                            })
+                            try:
+                                stream2 = await aclient.chat.completions.create(
+                                    model=LLM_MODEL,
+                                    messages=second_messages,
+                                    temperature=0.6,
+                                    stream=True,
+                                )
+                                s2_buf = ""
+                                async for chunk2 in stream2:
+                                    if not chunk2.choices:
+                                        continue
+                                    delta2 = chunk2.choices[0].delta
+                                    if delta2.content:
+                                        s2_buf += delta2.content
+                                        full_reply += delta2.content
+                                        while True:
+                                            sentence, remainder = _extract_complete_sentence(s2_buf)
+                                            if not sentence:
+                                                break
+                                            s2_buf = remainder
+                                            yield _sse({"type": "text", "text": sentence + " "})
+                                            for audio_chunk in _stream_tts_bytes(sentence):
+                                                b64 = base64.b64encode(audio_chunk).decode("ascii")
+                                                yield _sse({"type": "audio", "b64": b64})
+                                tail2 = s2_buf.strip()
+                                if tail2:
+                                    full_reply += tail2
+                                    yield _sse({"type": "text", "text": tail2})
+                                    for audio_chunk in _stream_tts_bytes(tail2):
+                                        b64 = base64.b64encode(audio_chunk).decode("ascii")
+                                        yield _sse({"type": "audio", "b64": b64})
+                            except Exception:
+                                log.exception(
+                                    "Second LLM pass after save_client_profile "
+                                    "failed for %s — falling back to backstop",
+                                    user_id,
+                                )
+
+                        # Backstop: only fires if BOTH the first pass AND the
+                        # second pass produced no spoken text at all (e.g. the
+                        # model went fully silent or the second call failed).
                         if (
                             result.get("saved")
                             and not full_reply.strip()
@@ -1213,9 +1302,7 @@ async def converse_stream(req: LlmReq, request: Request):
                             else:
                                 spoken = f"Got it — I'll call you {name_arg} from here."
                             log.info(
-                                "save_client_profile fired silently — emitting "
-                                "templated greeting (%d chars) so the avatar "
-                                "doesn't go silent",
+                                "save_client_profile backstop fired (%d chars)",
                                 len(spoken),
                             )
                             full_reply = spoken
@@ -1296,6 +1383,53 @@ async def converse_stream(req: LlmReq, request: Request):
     )
 
 
+@app.post("/api/transcribe")
+async def transcribe(request: Request):
+    """
+    Transcribe a short audio clip using OpenAI Whisper.
+
+    Accepts a raw audio body (Content-Type: audio/webm, audio/mp4, etc.).
+    The frontend sends the MediaRecorder blob directly as the request body —
+    no multipart encoding, no python-multipart dependency needed.
+    Returns { "text": "..." }.
+
+    Used by the push-to-talk button in index.html — replaces the browser's
+    Web Speech API which only works on HTTPS/localhost and depends on Google.
+    Whisper works on any URL (HTTP LAN, ngrok, etc.) and any modern browser.
+    """
+    audio_bytes = await request.body()
+    if not audio_bytes:
+        raise HTTPException(400, "Empty audio body")
+
+    # Whisper needs a filename with a recognisable extension so it picks
+    # the right decoder. Sniff from Content-Type header; default to webm
+    # (Chrome's MediaRecorder default).
+    content_type = (request.headers.get("content-type") or "audio/webm").split(";")[0].strip()
+    ext_map = {
+        "audio/webm": "webm",
+        "audio/ogg":  "ogg",
+        "audio/mp4":  "mp4",
+        "audio/mpeg": "mp3",
+        "audio/wav":  "wav",
+        "audio/x-wav":"wav",
+    }
+    ext = ext_map.get(content_type, "webm")
+    filename = f"recording.{ext}"
+
+    try:
+        import io
+        transcription = await aclient.audio.transcriptions.create(
+            model="whisper-1",
+            file=(filename, io.BytesIO(audio_bytes), content_type),
+        )
+        text = (transcription.text or "").strip()
+        log.info("Whisper: %d bytes → %r", len(audio_bytes), text[:80])
+        return {"text": text}
+    except Exception as e:
+        log.exception("Whisper transcription failed")
+        raise HTTPException(500, f"Transcription failed: {e}")
+
+
 @app.post("/api/calculate_spia")
 async def calculate_spia_endpoint(req: SpiaReq):
     """
@@ -1350,19 +1484,49 @@ async def forget(payload: dict, request: Request):
 # Serve the static frontend from the same origin.
 @app.get("/")
 async def index(request: Request):
-    """Serve index.html and mint a long-lived user_id cookie on first visit.
+    """Serve index.html and mint a session-scoped user_id cookie on first visit.
 
     The cookie is the stable identity for the per-user memory layer
     (see MEMORY_SUBSYSTEM.md). httponly=False so frontend JS can later
     read it for a 'this is me' / 'view your profile' UX. samesite=lax
-    so an external referral doesn't strip it on the redirect."""
+    so an external referral doesn't strip it on the redirect.
+
+    No max_age → session cookie: it dies when the browser tab/window closes,
+    which is the right default for a demo where each visitor is a distinct
+    person. Returning users who close and reopen the browser will get a new
+    UUID (and thus a fresh-visitor experience). If persistent identity across
+    browser restarts is needed later, restore max_age=USER_COOKIE_MAX_AGE."""
     response = FileResponse(os.path.join(_HERE, "index.html"))
     if not request.cookies.get(USER_COOKIE_NAME):
         response.set_cookie(
             USER_COOKIE_NAME,
             str(uuid.uuid4()),
-            max_age=USER_COOKIE_MAX_AGE,
+            # No max_age → session cookie (cleared when browser closes)
             httponly=False,
             samesite="lax",
         )
+    return response
+
+
+@app.get("/new")
+async def new_visitor(request: Request):
+    """Force a fresh visitor identity by minting a new UUID cookie and
+    redirecting to the app.
+
+    Use this to simulate a new visitor without closing the browser:
+        http://localhost:8000/new
+
+    This is especially useful during demos or testing when Chrome's shared
+    incognito cookie store would otherwise carry over a previous visitor's
+    identity into a 'new' incognito window."""
+    from fastapi.responses import RedirectResponse
+    response = RedirectResponse(url="/", status_code=302)
+    response.set_cookie(
+        USER_COOKIE_NAME,
+        str(uuid.uuid4()),
+        # Session cookie — no max_age
+        httponly=False,
+        samesite="lax",
+    )
+    log.info("New visitor forced via /new — fresh UUID minted")
     return response
