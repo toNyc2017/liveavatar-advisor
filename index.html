@@ -105,7 +105,7 @@
 
     <div class="panel">
         <div class="controls">
-            <button id="talk-btn" disabled>🎤 Hold to talk</button>
+            <button id="talk-btn" disabled>🎤 Press Ctrl+M to speak</button>
             <input type="text" id="user-input" placeholder="…or type a question and press Enter" disabled>
             <button id="ask-btn" disabled>Send</button>
         </div>
@@ -509,10 +509,18 @@ async function ask(text) {
             pcmBacklog = pcmBacklog.subarray(sliceSize);
             isFirstChunk = false;
             const b64 = b64EncodeBytes(slice);
-            // Serialize repeatAudio() calls so they don't trample each other
+            // Pace drain at real-time so we don't outrun LiveAvatar's play queue.
+            // PCM 24kHz 16-bit mono = 48000 bytes/sec. Sleep ~90% of the chunk's
+            // duration before queueing the next call — fast enough to keep
+            // playback continuous, slow enough that the LiveAvatar/LiveKit queue
+            // never goes more than one chunk deep. The earlier 30ms gap was
+            // dumping chunks an order of magnitude faster than playback rate,
+            // causing mid-reply audio drops on long replies (see logs).
+            const chunkDurationMs = (slice.byteLength / 48000) * 1000;
+            const paceMs = Math.max(30, chunkDurationMs * 0.9);
             chunkSendInProgress = chunkSendInProgress.then(async () => {
                 try { session.repeatAudio(b64); } catch (e) { console.warn("repeatAudio failed", e); }
-                await new Promise(r => setTimeout(r, 30));
+                await new Promise(r => setTimeout(r, paceMs));
             });
             if (flushAll && pcmBacklog.length === 0) return;
         }
@@ -614,8 +622,27 @@ async function setupWhisperPTT() {
     }
 }
 
-function startRecording() {
-    if (recognizing || !session || !window._micStream) return;
+async function startRecording() {
+    if (recognizing) return;
+    if (!session) {
+        console.warn("[mic] startRecording aborted: no active session — click 'Start session' first");
+        setStatus("Start a session before recording.", false);
+        return;
+    }
+    // If the mic stream was lost (browser revoked permission, tab was backgrounded,
+    // tracks ended, etc.), try to re-acquire it before bailing out.
+    const streamLive =
+        window._micStream &&
+        window._micStream.getAudioTracks().some(t => t.readyState === "live");
+    if (!streamLive) {
+        console.warn("[mic] _micStream missing/stale — re-requesting permission");
+        setStatus("Requesting microphone…", false);
+        const ok = await setupWhisperPTT();
+        if (!ok) {
+            console.warn("[mic] re-acquire failed — check site mic permission in browser settings");
+            return;
+        }
+    }
     try {
         audioChunks = [];
         mediaRecorder = new MediaRecorder(window._micStream);
@@ -696,8 +723,13 @@ talkBtn.addEventListener("click", (e) => { e.preventDefault(); toggleMic(); });
 // Ctrl+M = toggle mic (safe on Mac — won't trigger Siri, Dictation, or VoiceOver)
 // Space  = toggle mic when the text input isn't focused
 document.addEventListener("keydown", (e) => {
-    if (e.ctrlKey && e.code === "KeyM" && session) {
+    if (e.ctrlKey && e.code === "KeyM") {
         e.preventDefault();
+        console.debug("[mic] Ctrl+M pressed — session=", !!session, "micStream=", !!window._micStream);
+        if (!session) {
+            setStatus("Start a session before pressing Ctrl+M.", false);
+            return;
+        }
         toggleMic();
     }
     if (e.code === "Space" && document.activeElement !== inputEl && session) {

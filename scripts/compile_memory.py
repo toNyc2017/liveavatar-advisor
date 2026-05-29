@@ -99,6 +99,27 @@ preferences. Only what is explicitly in the digests; do not invent.
 Prefer specifics: "$400k IRA at Fidelity, $180k 401(k) at current
 employer" beats "significant retirement assets."
 
+GAP-RELEVANT FACTS — when the digests contain any of these, record
+them as separate, distinct lines. Never collapse essential and
+discretionary spending into a single "spending" figure, and never
+collapse guaranteed income sources into one number. The avatar's
+core mental model is "Retirement Income Gap = Essential Expenses −
+Guaranteed Income," and that math only works when these stay broken
+out:
+- Essential monthly spending (needs floor: housing, food, utilities,
+  healthcare, insurance, transportation)
+- Discretionary monthly spending (wants: travel, dining, hobbies,
+  gifts, luxury)
+- Guaranteed monthly income, by source (Social Security at age X,
+  pension starting Y, existing annuity income, etc.)
+- Retirement Income Gap, if computable from the above (state it
+  explicitly as a dollar number per month, positive = unfilled gap,
+  zero or negative = essentials already covered)
+
+If the digests only ever recorded a lump-sum spending figure, keep it
+as "total monthly spending ~$X" and surface "split essential vs.
+discretionary" in Active questions.
+
 ## Conversation history
 Chronological brief list, OLDEST FIRST. Each line:
   YYYY-MM-DD - topic - outcome

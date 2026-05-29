@@ -4,6 +4,11 @@
 > session). It captures the protocol, the prior wrong turns, and what's
 > next, so you don't have to re-derive any of it.
 >
+> See also: `CLAUDE.md` (project memory + index of canonical docs),
+> `SOUL.md` (design intent), `SESSION_NOTES.md` (current state), and
+> `TO_DO_IN_FUTURE.md` (running list of deferred work — add to it,
+> remove from it).
+>
 > **Before doing anything else: inventory what's already in this repo.**
 > `.env`, the original code in `~/.openclaw/workspace/skills/liveavatar-advisor/`,
 > any hardcoded constants, any TODO comments. The prior Cowork-session agent
