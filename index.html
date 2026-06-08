@@ -607,7 +607,23 @@ inputEl.addEventListener("keypress", (e) => { if (e.key === "Enter") ask(inputEl
 let mediaRecorder = null;
 let audioChunks = [];
 
-async function setupWhisperPTT() {
+// STT routing. Set once per session by pickRecordingMode():
+//   'deepgram' — browser streams audio to api.deepgram.com over a WebSocket
+//                using a short-lived JWT minted by /api/deepgram-token.
+//                Interim + final transcripts arrive while the user is still
+//                talking, so the final transcript is usually ready within
+//                ~200ms of release. This is the low-latency path.
+//   'whisper'  — fallback. The old MediaRecorder → /api/transcribe blob
+//                path. Used when DEEPGRAM_API_KEY isn't set in the
+//                backend's .env (so the token endpoint returns 503).
+let recordingMode = "whisper";  // safe default; pickRecordingMode upgrades
+
+// Deepgram streaming state
+let deepgramSocket = null;
+let deepgramTranscript = "";       // accumulated final transcripts
+let deepgramInterimText = "";       // latest interim (for inline display)
+
+async function setupMicrophone() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         window._micStream = stream;
@@ -621,28 +637,164 @@ async function setupWhisperPTT() {
         return false;
     }
 }
+// Backwards-compat alias — keep the old name in case anything else calls it.
+const setupWhisperPTT = setupMicrophone;
 
-async function startRecording() {
-    if (recognizing) return;
-    if (!session) {
-        console.warn("[mic] startRecording aborted: no active session — click 'Start session' first");
-        setStatus("Start a session before recording.", false);
-        return;
-    }
-    // If the mic stream was lost (browser revoked permission, tab was backgrounded,
-    // tracks ended, etc.), try to re-acquire it before bailing out.
-    const streamLive =
-        window._micStream &&
-        window._micStream.getAudioTracks().some(t => t.readyState === "live");
-    if (!streamLive) {
-        console.warn("[mic] _micStream missing/stale — re-requesting permission");
-        setStatus("Requesting microphone…", false);
-        const ok = await setupWhisperPTT();
-        if (!ok) {
-            console.warn("[mic] re-acquire failed — check site mic permission in browser settings");
-            return;
+async function pickRecordingMode() {
+    // Probe /api/deepgram-token once at session start. If the backend has
+    // DEEPGRAM_API_KEY configured, the streaming path is available;
+    // otherwise we transparently fall back to the Whisper buffered path.
+    try {
+        const res = await fetch(`${API}/api/deepgram-token`, { method: "POST" });
+        if (res.ok) {
+            recordingMode = "deepgram";
+            console.info("[stt] using Deepgram streaming");
+        } else {
+            recordingMode = "whisper";
+            console.info(`[stt] /api/deepgram-token returned ${res.status} — falling back to Whisper`);
         }
+    } catch (e) {
+        recordingMode = "whisper";
+        console.warn("[stt] /api/deepgram-token probe failed — falling back to Whisper:", e);
     }
+}
+
+// -------- Deepgram streaming STT --------
+async function startDeepgramRecording() {
+    // Fetch a fresh JWT (Deepgram tokens are short-lived; mint per-utterance
+    // rather than caching to avoid expiry races).
+    let token;
+    try {
+        const r = await fetch(`${API}/api/deepgram-token`, { method: "POST" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        token = (await r.json()).token;
+        if (!token) throw new Error("no token in response");
+    } catch (e) {
+        console.warn("[stt] token fetch failed — falling back to Whisper for this turn:", e);
+        recordingMode = "whisper";
+        return startWhisperRecording();
+    }
+
+    deepgramTranscript = "";
+    deepgramInterimText = "";
+
+    // Connection params:
+    //   model=nova-3          newest Deepgram model, best accuracy
+    //   interim_results=true  partial transcripts arrive as you speak
+    //   smart_format=true     punctuation + capitalization + number formatting
+    //   endpointing=300       300ms of silence = end-of-utterance
+    //   utterance_end_ms=1000 explicit utterance boundary if needed
+    const qs = new URLSearchParams({
+        model: "nova-3",
+        language: "en-US",
+        smart_format: "true",
+        interim_results: "true",
+        endpointing: "300",
+        utterance_end_ms: "1000",
+    });
+    const url = `wss://api.deepgram.com/v1/listen?${qs}`;
+
+    // Auth in browser WebSockets goes via the Sec-WebSocket-Protocol header.
+    // Important: long-lived API keys use ['token', key]; short-lived JWTs from
+    // /v1/auth/grant use ['bearer', jwt]. Using the wrong subprotocol makes
+    // the handshake silently fail (server closes the connection with no
+    // useful client-side error).
+    deepgramSocket = new WebSocket(url, ["bearer", token]);
+    deepgramSocket.binaryType = "arraybuffer";
+
+    // Wait for the socket to open before starting the recorder, otherwise
+    // the first audio chunks would be silently dropped.
+    try {
+        await new Promise((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error("Deepgram connect timeout")), 5000);
+            deepgramSocket.addEventListener("open", () => { clearTimeout(t); resolve(); }, { once: true });
+            deepgramSocket.addEventListener("error", (e) => { clearTimeout(t); reject(e); }, { once: true });
+        });
+    } catch (e) {
+        console.warn("[stt] Deepgram WS failed to open — falling back to Whisper:", e);
+        try { deepgramSocket.close(); } catch (_) {}
+        deepgramSocket = null;
+        recordingMode = "whisper";
+        return startWhisperRecording();
+    }
+
+    deepgramSocket.addEventListener("message", (event) => {
+        if (typeof event.data !== "string") return;  // ignore any binary frames
+        try {
+            const msg = JSON.parse(event.data);
+            const alt = msg?.channel?.alternatives?.[0];
+            if (!alt) return;
+            const transcript = (alt.transcript || "").trim();
+            if (!transcript) return;
+            if (msg.is_final) {
+                deepgramTranscript = (deepgramTranscript + " " + transcript).trim();
+                deepgramInterimText = "";
+            } else {
+                deepgramInterimText = transcript;
+            }
+            inputEl.value = (deepgramTranscript + " " + deepgramInterimText).trim();
+        } catch (e) {
+            console.warn("[stt] Deepgram message parse:", e, event.data);
+        }
+    });
+
+    // MediaRecorder with a 250ms timeslice so audio chunks stream to
+    // Deepgram every quarter-second.
+    mediaRecorder = new MediaRecorder(window._micStream);
+    mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0 && deepgramSocket?.readyState === WebSocket.OPEN) {
+            deepgramSocket.send(e.data);
+        }
+    };
+    mediaRecorder.start(250);
+
+    recognizing = true;
+    talkBtn.classList.add("recording");
+    talkBtn.textContent = "● Recording — press Ctrl+M to send";
+    inputEl.value = "";
+}
+
+async function stopDeepgramRecording() {
+    if (!recognizing) return;
+    recognizing = false;
+    talkBtn.classList.remove("recording");
+    talkBtn.textContent = "⏳ Finalizing…";
+    talkBtn.disabled = true;
+
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        await new Promise((resolve) => {
+            mediaRecorder.onstop = resolve;
+            mediaRecorder.stop();
+        });
+    }
+
+    // Tell Deepgram we're done sending audio. They emit any trailing
+    // final transcript, then close. We wait up to 800ms for the tail.
+    if (deepgramSocket && deepgramSocket.readyState === WebSocket.OPEN) {
+        try { deepgramSocket.send(JSON.stringify({ type: "CloseStream" })); } catch (_) {}
+        const settled = new Promise((resolve) => {
+            const t = setTimeout(resolve, 800);
+            deepgramSocket.addEventListener("close", () => { clearTimeout(t); resolve(); }, { once: true });
+        });
+        await settled;
+    }
+    try { deepgramSocket?.close(); } catch (_) {}
+    deepgramSocket = null;
+
+    const text = (deepgramTranscript + " " + deepgramInterimText).trim();
+    talkBtn.textContent = "🎤 Press Ctrl+M to speak";
+    talkBtn.disabled = false;
+
+    if (text) {
+        inputEl.value = text;
+        ask(text);
+    } else {
+        setStatus("Couldn't hear anything — try again.", false);
+    }
+}
+
+// -------- Whisper buffered STT (fallback) --------
+async function startWhisperRecording() {
     try {
         audioChunks = [];
         mediaRecorder = new MediaRecorder(window._micStream);
@@ -653,12 +805,12 @@ async function startRecording() {
         talkBtn.textContent = "● Recording — press Ctrl+M to send";
         inputEl.value = "";
     } catch (e) {
-        console.warn("startRecording error:", e);
+        console.warn("startWhisperRecording error:", e);
         setStatus("Could not start recording: " + e.message, false);
     }
 }
 
-async function stopRecording() {
+async function stopWhisperRecording() {
     if (!mediaRecorder || !recognizing) return;
     recognizing = false;
     talkBtn.classList.remove("recording");
@@ -703,16 +855,53 @@ async function stopRecording() {
     }
 }
 
+// -------- Router --------
+async function startRecording() {
+    if (recognizing) return;
+    if (!session) {
+        console.warn("[mic] startRecording aborted: no active session — click 'Start session' first");
+        setStatus("Start a session before recording.", false);
+        return;
+    }
+    // If the mic stream was lost (browser revoked permission, tab was backgrounded,
+    // tracks ended, etc.), try to re-acquire it before bailing out.
+    const streamLive =
+        window._micStream &&
+        window._micStream.getAudioTracks().some(t => t.readyState === "live");
+    if (!streamLive) {
+        console.warn("[mic] _micStream missing/stale — re-requesting permission");
+        setStatus("Requesting microphone…", false);
+        const ok = await setupMicrophone();
+        if (!ok) {
+            console.warn("[mic] re-acquire failed — check site mic permission in browser settings");
+            return;
+        }
+    }
+    if (recordingMode === "deepgram") return startDeepgramRecording();
+    return startWhisperRecording();
+}
+
+async function stopRecording() {
+    if (recordingMode === "deepgram" && deepgramSocket) return stopDeepgramRecording();
+    return stopWhisperRecording();
+}
+
 function toggleMic() {
     if (recognizing) stopRecording();
     else startRecording();
 }
 
 function setupSpeechRecognition() {
-    setupWhisperPTT().then((ok) => {
-        talkBtn.disabled = !ok;
-        if (ok) talkBtn.textContent = "🎤 Press Ctrl+M to speak";
-        else talkBtn.title = "Microphone not available — check browser permissions.";
+    // Fire mic acquisition and STT-mode probe in parallel — they're
+    // independent and both need to be done before the talk button enables.
+    Promise.all([setupMicrophone(), pickRecordingMode()]).then(([micOk]) => {
+        talkBtn.disabled = !micOk;
+        if (micOk) {
+            const suffix = recordingMode === "deepgram" ? " (Deepgram)" : " (Whisper)";
+            talkBtn.textContent = "🎤 Press Ctrl+M to speak" + suffix;
+        } else {
+            talkBtn.title = "Microphone not available — check browser permissions.";
+        }
     });
     return true;
 }

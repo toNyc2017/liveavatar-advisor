@@ -34,6 +34,7 @@ from openai import AsyncOpenAI
 import base64
 import re
 from elevenlabs import ElevenLabs
+from elevenlabs.types import VoiceSettings
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -141,6 +142,36 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel (public)
+
+# Streaming STT via Deepgram. When DEEPGRAM_API_KEY is set, the browser
+# opens a WebSocket directly to api.deepgram.com using a short-lived JWT
+# minted by /api/deepgram-token — transcription happens *while the user
+# is speaking*, instead of after they release the button (which is what
+# the older Whisper path does). Significantly lower felt latency per
+# turn. If the key is absent, the frontend transparently falls back to
+# the Whisper buffered path so nothing breaks.
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+DEEPGRAM_TOKEN_TTL_SECONDS = int(os.getenv("DEEPGRAM_TOKEN_TTL_SECONDS", "60"))
+
+# Voice settings tuned for a *lively* clone of a real voice.
+#
+# Defaults shipped by ElevenLabs are high-stability / zero-style, which is
+# the textbook recipe for a "robotic" delivery — the engine flattens
+# prosody to maximize consistency. Lower stability widens the emotional
+# range; modest style exaggeration amplifies the cloned speaker's
+# personality; similarity_boost keeps the timbre recognizably "us"; and
+# speaker_boost adds a touch of presence at a small latency cost.
+#
+# These are env-overridable so an A/B test is just a restart away. If
+# the voice starts to feel *too* lively (drifting, occasional weird
+# stresses), nudge stability up toward 0.45 and style down toward 0.35.
+VOICE_SETTINGS = VoiceSettings(
+    stability=float(os.getenv("VOICE_STABILITY", "0.32")),
+    similarity_boost=float(os.getenv("VOICE_SIMILARITY", "0.85")),
+    style=float(os.getenv("VOICE_STYLE", "0.55")),
+    use_speaker_boost=True,
+    speed=float(os.getenv("VOICE_SPEED", "1.0")),
+)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CHROMA_PATH = os.path.join(_HERE, "chroma_db")
@@ -1064,6 +1095,7 @@ def tts(req: TtsReq):
         text=req.text,
         model_id="eleven_flash_v2_5",
         output_format="pcm_24000",
+        voice_settings=VOICE_SETTINGS,
     )
     audio_bytes = b"".join(audio_gen)
     log.info("TTS: %d chars → %d PCM bytes", len(req.text), len(audio_bytes))
@@ -1124,6 +1156,7 @@ def _stream_tts_bytes(text: str):
         text=text,
         model_id="eleven_flash_v2_5",
         output_format="pcm_24000",
+        voice_settings=VOICE_SETTINGS,
     )
     for chunk in audio_gen:
         if chunk:
@@ -1485,6 +1518,39 @@ async def converse_stream(req: LlmReq, request: Request):
             "X-Accel-Buffering": "no",  # disable proxy buffering
         },
     )
+
+
+@app.post("/api/deepgram-token")
+async def deepgram_token():
+    """Mint a short-lived JWT for browser-side Deepgram streaming.
+
+    The browser opens `wss://api.deepgram.com/v1/listen?...` directly with
+    this token (passed via the `Sec-WebSocket-Protocol: token, <jwt>`
+    subprotocol header). One fewer network hop than proxying audio
+    through this backend, and Deepgram's WebSocket sits in the same
+    us-east region as most of our other API dependencies.
+
+    Returns 503 when DEEPGRAM_API_KEY isn't configured so the frontend
+    can transparently fall back to the Whisper buffered path. Returns
+    502 if Deepgram itself rejects the grant request (rare; usually
+    means a billing/credentials issue worth surfacing).
+    """
+    if not DEEPGRAM_API_KEY:
+        raise HTTPException(503, "Deepgram not configured (DEEPGRAM_API_KEY not set)")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.post(
+            "https://api.deepgram.com/v1/auth/grant",
+            headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
+            json={"ttl_seconds": DEEPGRAM_TOKEN_TTL_SECONDS},
+        )
+    if res.status_code >= 300:
+        log.error("Deepgram /v1/auth/grant failed (%s): %s", res.status_code, res.text)
+        raise HTTPException(502, f"Deepgram auth failed: {res.text}")
+    data = res.json()
+    return {
+        "token": data.get("access_token"),
+        "expires_in": data.get("expires_in", DEEPGRAM_TOKEN_TTL_SECONDS),
+    }
 
 
 @app.post("/api/transcribe")
