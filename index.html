@@ -135,6 +135,20 @@
         <div class="calc-disclaimer" id="calc-disclaimer"></div>
     </div>
 
+    <!-- Conversation summary panel — shown only when the avatar fires the
+         generate_conversation_summary tool. PDF-only by design. -->
+    <div class="panel calc-panel" id="summary-panel" style="display:none;">
+        <div class="calc-header">
+            <h3 id="summary-title">Our conversations to date</h3>
+            <div class="calc-actions">
+                <button id="summary-download-pdf" class="secondary" title="Download as PDF">📑 .pdf</button>
+                <button id="summary-close" class="secondary" title="Hide this summary">✕</button>
+            </div>
+        </div>
+        <div id="summary-meta" class="calc-disclaimer" style="border-top:none;margin-top:0;padding-top:0;"></div>
+        <div id="summary-body" style="font-size:14px;line-height:1.55;"></div>
+    </div>
+
 </div>
 
 <!--
@@ -373,6 +387,179 @@ $("calc-close").addEventListener("click", () => {
     $("calc-panel").style.display = "none";
 });
 
+// ---------- Conversation summary panel ----------
+//
+// Backend tool `generate_conversation_summary` returns:
+//   { title, prepared_for, generated_at, summary_intro,
+//     sections: [{heading, body}, ...], filename_stem }
+// We render it in the summary panel and offer a single PDF download.
+let _lastSummaryResult = null;
+
+function renderSummaryResult(s) {
+    _lastSummaryResult = s;
+    const panel = $("summary-panel");
+    $("summary-title").textContent = s.title || "Our conversations to date";
+
+    // Meta line: "Prepared for Tom · 2026-06-11"
+    const metaParts = [];
+    if (s.prepared_for) metaParts.push("Prepared for " + s.prepared_for);
+    if (s.generated_at) metaParts.push(s.generated_at);
+    $("summary-meta").textContent = metaParts.join(" · ");
+
+    // Body — intro paragraph, then each section's heading + body. Body
+    // text is plain prose (no markdown); we render paragraph breaks
+    // visually by splitting on blank lines.
+    const body = $("summary-body");
+    body.innerHTML = "";
+
+    if (s.summary_intro) {
+        const intro = document.createElement("div");
+        intro.style.cssText = "margin: 14px 0 18px 0; color: var(--ink);";
+        for (const para of (s.summary_intro || "").split(/\n\s*\n/)) {
+            if (!para.trim()) continue;
+            const p = document.createElement("p");
+            p.style.margin = "0 0 10px 0";
+            p.textContent = para.trim();
+            intro.appendChild(p);
+        }
+        body.appendChild(intro);
+    }
+
+    for (const sect of (s.sections || [])) {
+        const h = document.createElement("h4");
+        h.style.cssText = "margin: 16px 0 8px 0; font-size: 14px; "
+            + "font-weight: 600; color: var(--accent);";
+        h.textContent = sect.heading || "";
+        body.appendChild(h);
+
+        for (const para of (sect.body || "").split(/\n\s*\n/)) {
+            if (!para.trim()) continue;
+            const p = document.createElement("p");
+            p.style.margin = "0 0 10px 0";
+            p.textContent = para.trim();
+            body.appendChild(p);
+        }
+    }
+
+    panel.style.display = "block";
+    panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function summaryPdfDownload(s) {
+    if (!window.jspdf) {
+        alert("PDF library failed to load. Try a hard-reload of the page.");
+        return;
+    }
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: "pt", format: "letter" });
+    const PAGE_W = 612;
+    const PAGE_H = 792;
+    const M = 56;        // page margin
+    const MAX_W = PAGE_W - 2 * M;
+    let y = M;
+
+    const ensureRoom = (h) => {
+        if (y + h > PAGE_H - M) {
+            doc.addPage();
+            y = M;
+        }
+    };
+
+    // Title
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(22);
+    doc.text(s.title || "Our conversations to date", M, y);
+    y += 24;
+
+    // Meta line
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    doc.setTextColor(120);
+    const metaParts = [];
+    if (s.prepared_for) metaParts.push("Prepared for " + s.prepared_for);
+    if (s.generated_at) metaParts.push(s.generated_at);
+    if (metaParts.length) {
+        doc.text(metaParts.join("   ·   "), M, y);
+        y += 10;
+    }
+    doc.setDrawColor(200);
+    doc.line(M, y, PAGE_W - M, y);
+    y += 20;
+    doc.setTextColor(0);
+
+    // Helper: render a block of prose with proper paragraph spacing.
+    const writeProse = (text, opts = {}) => {
+        const size = opts.size || 11;
+        const lineHeight = opts.lineHeight || 16;
+        const paraGap = opts.paraGap || 8;
+        doc.setFont("helvetica", opts.italic ? "italic" : "normal");
+        doc.setFontSize(size);
+        doc.setTextColor(opts.muted ? 80 : 20);
+        for (const para of (text || "").split(/\n\s*\n/)) {
+            const cleaned = para.replace(/\s+/g, " ").trim();
+            if (!cleaned) continue;
+            const lines = doc.splitTextToSize(cleaned, MAX_W);
+            for (const line of lines) {
+                ensureRoom(lineHeight);
+                doc.text(line, M, y);
+                y += lineHeight;
+            }
+            y += paraGap;
+        }
+    };
+
+    // Intro (italic, slightly muted, sets the tone)
+    if (s.summary_intro) {
+        writeProse(s.summary_intro, { italic: true, muted: true, size: 11 });
+        y += 4;
+    }
+
+    // Sections
+    for (const sect of (s.sections || [])) {
+        ensureRoom(28);
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(13);
+        doc.setTextColor(0);
+        doc.text(sect.heading || "", M, y);
+        y += 6;
+        doc.setDrawColor(220);
+        doc.line(M, y, M + 60, y);
+        y += 14;
+        writeProse(sect.body || "");
+        y += 6;
+    }
+
+    // Footer disclaimer
+    ensureRoom(40);
+    doc.setDrawColor(200);
+    doc.line(M, y, PAGE_W - M, y);
+    y += 14;
+    doc.setFont("helvetica", "italic");
+    doc.setFontSize(9);
+    doc.setTextColor(110);
+    const disc = "This summary was generated from your conversation notes. "
+        + "It is for personal recall and is not a personalized financial, "
+        + "tax, or legal recommendation. For a binding plan, work with a "
+        + "licensed advisor who knows your full picture.";
+    for (const line of doc.splitTextToSize(disc, MAX_W)) {
+        ensureRoom(12);
+        doc.text(line, M, y);
+        y += 12;
+    }
+
+    const stem = s.filename_stem
+        || `advisor_summary_${new Date().toISOString().slice(0,10)}`;
+    doc.save(`${stem}.pdf`);
+}
+
+$("summary-download-pdf").addEventListener("click", () => {
+    if (!_lastSummaryResult) return;
+    summaryPdfDownload(_lastSummaryResult);
+});
+$("summary-close").addEventListener("click", () => {
+    $("summary-panel").style.display = "none";
+});
+
 // ---------- Session lifecycle ----------
 startBtn.addEventListener("click", async () => {
     startBtn.disabled = true; startBtn.textContent = "Starting…";
@@ -568,6 +755,8 @@ async function ask(text) {
                     if (msg.b64) appendPcm(b64DecodeToBytes(msg.b64));
                 } else if (msg.type === "calculator_result") {
                     if (msg.data) renderCalculatorResult(msg.data);
+                } else if (msg.type === "summary_result") {
+                    if (msg.data) renderSummaryResult(msg.data);
                 } else if (msg.type === "error") {
                     throw new Error(msg.message || "stream error");
                 } else if (msg.type === "done") {

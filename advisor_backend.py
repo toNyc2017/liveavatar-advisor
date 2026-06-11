@@ -371,7 +371,26 @@ APP CAPABILITIES (things this application can actually do — don't disclaim the
   your screen. Click PDF for a printable version, or TXT or JSON if you want
   the raw numbers."
 - If the user wants to share with a spouse or advisor, point them at the same
-  download buttons rather than promising to email or transmit anything yourself."""
+  download buttons rather than promising to email or transmit anything yourself.
+- When the client asks for a summary, recap, overview, or "what have we
+  talked about" — or says they'd like to save / download / print a record
+  of your conversations — call the `generate_conversation_summary` tool.
+  The app will render a structured summary panel on screen with a PDF
+  download button. Your spoken reply should briefly point them at the
+  on-screen panel and the download button. Do NOT recite the summary
+  aloud — let them read it. Examples:
+  Client: "Can you give me a summary of what we've covered?"
+  You: [tool: generate_conversation_summary] "I just put a summary of our
+       conversations up on your screen. There's a download button right
+       there if you want to save the PDF. Want me to walk you through
+       any part of it?"
+  Client: "I'd like a writeup I can review later."
+  You: [tool: generate_conversation_summary] "Here you go — the summary's
+       up on your screen now, with a PDF download button next to it."
+- Only fire `generate_conversation_summary` when the client explicitly
+  wants a saved record they can review later. For a casual mid-conversation
+  "remind me what we discussed," just answer in your own voice — don't
+  spawn a document panel for an in-flight chat."""
 
 aclient = AsyncOpenAI()  # uses OPENAI_API_KEY from env
 
@@ -686,6 +705,194 @@ async def compile_user_memory(user_id: str) -> bool:
     return True
 
 
+# ---- Conversation summary (for the on-screen download panel) ---------------
+#
+# Triggered by the `generate_conversation_summary` LLM tool when the client
+# asks for a recap/summary of past conversations. Reads USER.md + MEMORY.md
+# + the most recent raw digests, asks the LLM to synthesize a structured
+# document, and returns it as a dict the frontend renders into a panel
+# with a PDF download button (mirrors how the SPIA calculator works).
+#
+# Output shape (also what `_run_tool` returns):
+#   {
+#     "title":         str,            # e.g. "Our conversations to date"
+#     "prepared_for":  str | None,     # client's preferred name, if known
+#     "generated_at":  str,            # YYYY-MM-DD
+#     "summary_intro": str,            # 2-4 sentence opener
+#     "sections": [
+#       {"heading": str, "body": str}, # body is plain prose paragraphs,
+#       ...                            # not markdown — the PDF renderer
+#     ],                               # word-wraps it as-is
+#     "filename_stem": str             # e.g. "advisor_summary_tom_2026-06-11"
+#   }
+
+_SUMMARY_SYSTEM_PROMPT = """You are summarizing a series of past
+conversations between Tom Olds (a financial advisor specializing in
+retirement and annuities) and one client. You are writing a
+take-home document the client will read on their own.
+
+You will be given:
+- The client's durable profile (USER.md), if any.
+- A compiled wiki of their history with Tom (MEMORY.md), if any.
+- Up to ten recent raw session digests, oldest first.
+
+Produce a clean, warm summary document. Output STRICT JSON with this
+exact shape — nothing else:
+
+{
+  "title": "Our conversations to date",
+  "prepared_for": "<first name, or empty string if unknown>",
+  "summary_intro": "<2 to 4 sentences. Personal, warm, written TO the
+                    client, not about them. State the arc of what
+                    you've discussed and what you've learned about
+                    their situation. No bullets. No headings.>",
+  "sections": [
+    {
+      "heading": "Where we've been",
+      "body": "<2-4 paragraphs of plain prose. The arc of the
+               conversations: what brought them in, what we focused
+               on, how their thinking evolved across sessions. Names
+               the major topics. Plain prose, no bullets, no markdown.>"
+    },
+    {
+      "heading": "What you've shared with me",
+      "body": "<Consolidated facts about their situation: age, family,
+               accounts, income sources, essential vs. discretionary
+               spending, concerns. Plain prose paragraphs grouped by
+               theme. Preserve the needs/wants split where present.
+               No bullets, no markdown, no tables.>"
+    },
+    {
+      "heading": "Where we've landed",
+      "body": "<Decisions reached, recommendations given, calculator
+               results discussed, any framing or principles we came
+               back to. Plain prose, no bullets.>"
+    },
+    {
+      "heading": "Open threads",
+      "body": "<Questions still on the table, things to revisit next
+               time, missing facts that would sharpen the picture.
+               Plain prose, can be one paragraph if there's not much.>"
+    }
+  ]
+}
+
+Constraints:
+- VOICE: warm, second-person ("you said...", "your goal..."), Tom's
+  Munger-spine + Hanks-acknowledgment register. No corporate filler.
+- LENGTH: each section body 80 to 220 words. The whole doc should
+  read in under 3 minutes.
+- NO MARKDOWN inside section bodies. No "**bold**", no "- bullets",
+  no headers. Plain prose paragraphs separated by blank lines.
+- If a section truly has nothing to say (e.g. brand new client with
+  no prior sessions), keep the heading and write one honest sentence:
+  "We're just getting started — this part will fill in as we talk."
+- Never invent facts. If something isn't in the source material,
+  don't put it in the summary.
+- Use spoken-form numbers in prose where natural ("four oh one K",
+  "five hundred thousand dollars"), since the client may read this
+  aloud or get it read to them.
+- "prepared_for" must be just the first name, or empty string if no
+  name is on file. Do NOT make one up.
+
+Output JSON ONLY. No prose before or after. No code fences.
+"""
+
+
+async def _generate_conversation_summary(user_id: str) -> dict:
+    """Build a structured summary document for the on-screen download.
+
+    Reads USER.md + MEMORY.md + recent session digests for this
+    visitor, asks the LLM to synthesize a take-home doc, returns the
+    parsed dict ready to send down the SSE stream as a
+    `summary_result` event.
+
+    Refuses politely for anonymous users (no persisted history) so the
+    avatar can give a useful spoken explanation instead of trying to
+    render an empty document.
+    """
+    if not user_id or user_id.startswith("anon-"):
+        return {"error": "anonymous_user",
+                "message": "No saved profile or history for this visitor yet."}
+
+    user_dir = USERS_DIR / user_id
+    if not user_dir.exists():
+        return {"error": "no_history",
+                "message": "Nothing on file for this visitor yet."}
+
+    # Gather the source material the synthesis LLM will work from.
+    sources: list[str] = []
+    name_hint = ""
+    user_md = user_dir / "USER.md"
+    if user_md.exists():
+        body = user_md.read_text(encoding="utf-8").strip()
+        if body:
+            sources.append("=== USER.md (durable profile) ===\n" + body)
+            # Cheap parse for first name, used as a fallback if the LLM
+            # forgets to populate prepared_for.
+            for line in body.splitlines():
+                if "**Name:**" in line:
+                    name_hint = line.split("**Name:**", 1)[1].strip()
+                    break
+    memory_md = user_dir / "MEMORY.md"
+    if memory_md.exists():
+        body = memory_md.read_text(encoding="utf-8").strip()
+        if body:
+            sources.append("=== MEMORY.md (compiled history) ===\n" + body)
+    raw_dir = user_dir / "memory"
+    if raw_dir.exists():
+        digest_paths = sorted(raw_dir.glob("*.md"))[-10:]
+        for p in digest_paths:
+            try:
+                txt = p.read_text(encoding="utf-8").strip()
+                if txt:
+                    sources.append(f"=== Session digest {p.stem} ===\n" + txt)
+            except Exception:
+                log.exception("Could not read session digest %s", p)
+
+    if not sources:
+        return {"error": "no_history",
+                "message": "No prior conversations on file to summarize yet."}
+
+    raw = "\n\n".join(sources)
+    # Crude cap so we don't blow the context window on chatty clients.
+    if len(raw) > 60_000:
+        raw = raw[:60_000] + "\n\n[…earlier material truncated for length…]"
+
+    messages = [
+        {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": raw},
+    ]
+    try:
+        completion = await aclient.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+        body_text = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        log.exception("Conversation-summary LLM call failed for %s", user_id)
+        return {"error": "llm_failed", "message": str(e)}
+
+    try:
+        parsed = json.loads(body_text)
+    except json.JSONDecodeError:
+        log.error("Conversation summary returned non-JSON for %s: %r",
+                  user_id, body_text[:400])
+        return {"error": "bad_json",
+                "message": "Summary came back in an unexpected shape."}
+
+    # Backfill metadata the LLM doesn't generate.
+    today = datetime.now().strftime("%Y-%m-%d")
+    parsed["generated_at"] = today
+    if not parsed.get("prepared_for") and name_hint:
+        parsed["prepared_for"] = name_hint
+    stem_name = (parsed.get("prepared_for") or "client").lower().replace(" ", "_")
+    parsed["filename_stem"] = f"advisor_summary_{stem_name}_{today}"
+    return parsed
+
+
 def save_user_profile(user_id: str, name: str, notes: str | None = None) -> dict:
     """Create or update users/<user_id>/USER.md with the captured name +
     optional notes. Called by the save_client_profile LLM tool when a
@@ -938,6 +1145,29 @@ LLM_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_conversation_summary",
+            "description": (
+                "Build a take-home summary document of your past conversations "
+                "with this client, covering what's been discussed, what you've "
+                "learned about their retirement picture, the decisions and "
+                "recommendations reached, and the questions still open. Call "
+                "this when the client asks for a summary, recap, overview, "
+                "or 'what have we talked about,' OR when they ask to "
+                "download / save / print a record of the conversations. The "
+                "app renders the result as an on-screen panel with a PDF "
+                "download button — your spoken reply should point them at "
+                "that button. Takes no parameters: it uses the visitor's "
+                "stored profile + memory automatically. Do NOT call this on "
+                "every recap-flavored turn — only when the client explicitly "
+                "wants a saved record, or asked for a summary they could "
+                "review later."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -1022,6 +1252,7 @@ async def llm(req: LlmReq, request: Request):
     )
     msg = completion.choices[0].message
     calculator_result: dict | None = None
+    conversation_summary: dict | None = None
 
     if msg.tool_calls:
         # Append the assistant's tool-calling turn to messages (required by API)
@@ -1044,9 +1275,16 @@ async def llm(req: LlmReq, request: Request):
                 args = _json.loads(tc.function.arguments or "{}")
             except _json.JSONDecodeError:
                 args = {}
-            tool_output = _run_tool(tc.function.name, args, user_id=user_id)
-            if tc.function.name == "calculate_spia" and "error" not in tool_output:
-                calculator_result = tool_output
+            # generate_conversation_summary is async (it makes its own LLM call
+            # to synthesize the doc); the other tools are sync via _run_tool.
+            if tc.function.name == "generate_conversation_summary":
+                tool_output = await _generate_conversation_summary(user_id)
+                if "error" not in tool_output:
+                    conversation_summary = tool_output
+            else:
+                tool_output = _run_tool(tc.function.name, args, user_id=user_id)
+                if tc.function.name == "calculate_spia" and "error" not in tool_output:
+                    calculator_result = tool_output
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -1073,6 +1311,8 @@ async def llm(req: LlmReq, request: Request):
     response: dict = {"reply": reply}
     if calculator_result is not None:
         response["calculator_result"] = calculator_result
+    if conversation_summary is not None:
+        response["conversation_summary"] = conversation_summary
     return response
 
 
@@ -1441,6 +1681,59 @@ async def converse_stream(req: LlmReq, request: Request):
                             log.info(
                                 "save_client_profile backstop fired (%d chars)",
                                 len(spoken),
+                            )
+                            full_reply = spoken
+                            buffer = spoken
+                            while True:
+                                sentence, remainder = _extract_complete_sentence(buffer)
+                                if not sentence:
+                                    break
+                                buffer = remainder
+                                yield _sse({"type": "text", "text": sentence + " "})
+                                for audio_chunk in _stream_tts_bytes(sentence):
+                                    b64 = base64.b64encode(audio_chunk).decode("ascii")
+                                    yield _sse({"type": "audio", "b64": b64})
+                            if buffer.strip():
+                                yield _sse({"type": "text", "text": buffer})
+                                for audio_chunk in _stream_tts_bytes(buffer):
+                                    b64 = base64.b64encode(audio_chunk).decode("ascii")
+                                    yield _sse({"type": "audio", "b64": b64})
+                        continue
+
+                    if slot["name"] == "generate_conversation_summary":
+                        try:
+                            summary = await _generate_conversation_summary(user_id)
+                        except Exception as e:
+                            log.exception("conversation summary failed")
+                            summary = {"error": "exception", "message": str(e)}
+
+                        if "error" in summary:
+                            # Honest spoken response for the failure modes —
+                            # anonymous visitor, no history yet, or LLM glitch.
+                            if summary["error"] in ("anonymous_user", "no_history"):
+                                msg = ("I'd love to put a summary together for you, "
+                                       "but I don't have any past conversations on file "
+                                       "to draw from yet. Let's talk through what's on "
+                                       "your mind today and we'll build the picture from there.")
+                            else:
+                                msg = ("Something hiccupped on my end putting that summary "
+                                       "together. Try asking me again in a moment.")
+                            yield _sse({"type": "text", "text": msg})
+                            for audio_chunk in _stream_tts_bytes(msg):
+                                b64 = base64.b64encode(audio_chunk).decode("ascii")
+                                yield _sse({"type": "audio", "b64": b64})
+                            full_reply = msg
+                        else:
+                            # Render the panel — the frontend will show the
+                            # document with a PDF download button.
+                            yield _sse({"type": "summary_result", "data": summary})
+                            name_part = summary.get("prepared_for") or ""
+                            spoken = (
+                                f"{(name_part + ', ') if name_part else ''}"
+                                "I just put a summary of our conversations up on your screen. "
+                                "There's a download button right there on the panel — "
+                                "click it for a PDF you can keep or share. "
+                                "Want me to walk you through any part of it now?"
                             )
                             full_reply = spoken
                             buffer = spoken
