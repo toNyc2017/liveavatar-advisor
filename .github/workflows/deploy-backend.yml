@@ -1,0 +1,165 @@
+# Phase C of the deploy pipeline: build the backend container, push to
+# ECR, and let App Runner pick it up via AutoDeployment (it watches the
+# :latest tag).
+#
+# Required GitHub repo Variables (Settings → Secrets and variables → Actions → Variables):
+#   AWS_REGION              — e.g. us-east-1
+#   AWS_ACCOUNT_ID          — 12-digit AWS account id
+#   AWS_DEPLOY_ROLE_ARN     — output of the bootstrap-oidc.yaml stack
+#   ECR_REPO_NAME           — output of the apprunner.yaml stack (default: liveavatar-advisor)
+#   APPRUNNER_SERVICE_ARN   — output of the apprunner.yaml stack
+#
+# No secrets needed in GitHub — auth happens via OIDC.
+
+name: deploy-backend
+
+on:
+  push:
+    branches: [main]
+    # Skip redeploys for changes that don't affect the running container.
+    paths:
+      - "advisor_backend.py"
+      - "storage.py"
+      - "index.html"
+      - "scripts/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "requirements-runtime.txt"
+      - ".github/workflows/deploy-backend.yml"
+  workflow_dispatch:
+    inputs:
+      force_apprunner_deploy:
+        description: "Explicitly call StartDeployment after the ECR push (in case AutoDeployments is off)"
+        type: boolean
+        default: false
+
+# Prevent two pushes from racing each other to App Runner.
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # required for OIDC
+  contents: read
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      ECR_REPO_NAME: ${{ vars.ECR_REPO_NAME }}
+      APPRUNNER_SERVICE_ARN: ${{ vars.APPRUNNER_SERVICE_ARN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Short session — only need it long enough to push + maybe poke App Runner.
+          role-session-name: github-deploy-backend-${{ github.run_id }}
+
+      - name: Sanity-check required variables
+        run: |
+          missing=0
+          for v in AWS_REGION AWS_ACCOUNT_ID ECR_REPO_NAME APPRUNNER_SERVICE_ARN; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Missing required GitHub Variable: $v"
+              missing=1
+            fi
+          done
+          if [ "$missing" = "1" ]; then exit 1; fi
+          echo "All required variables present."
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
+          SHA_TAG="sha-$(echo ${GITHUB_SHA} | cut -c1-12)"
+          echo "ecr_uri=$ECR_URI" >> $GITHUB_OUTPUT
+          echo "sha_tag=$SHA_TAG" >> $GITHUB_OUTPUT
+          echo "Image will be tagged: ${ECR_URI}:${SHA_TAG} and ${ECR_URI}:latest"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.ecr_uri }}:latest
+            ${{ steps.tags.outputs.ecr_uri }}:${{ steps.tags.outputs.sha_tag }}
+          # Cache layers from the registry so subsequent builds are fast.
+          cache-from: type=registry,ref=${{ steps.tags.outputs.ecr_uri }}:buildcache
+          cache-to: type=registry,ref=${{ steps.tags.outputs.ecr_uri }}:buildcache,mode=max
+          # linux/amd64 matches App Runner's instance arch. Don't waste
+          # time building arm64.
+          platforms: linux/amd64
+          provenance: false
+
+      # App Runner watches :latest with AutoDeploymentsEnabled=true and
+      # will redeploy on its own. The explicit StartDeployment below is
+      # for the manual-dispatch path and as a defensive fallback if the
+      # auto-deploy webhook is delayed.
+      - name: Trigger App Runner deployment (manual dispatch only)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.force_apprunner_deploy }}
+        run: |
+          set -euo pipefail
+          echo "Calling apprunner:StartDeployment on ${APPRUNNER_SERVICE_ARN}"
+          OP_ID=$(aws apprunner start-deployment \
+            --service-arn "$APPRUNNER_SERVICE_ARN" \
+            --query OperationId --output text)
+          echo "OperationId=$OP_ID"
+
+      - name: Wait for App Runner to become healthy
+        run: |
+          set -euo pipefail
+          echo "Polling App Runner service status..."
+          for i in $(seq 1 60); do
+            STATUS=$(aws apprunner describe-service \
+              --service-arn "$APPRUNNER_SERVICE_ARN" \
+              --query 'Service.Status' --output text)
+            URL=$(aws apprunner describe-service \
+              --service-arn "$APPRUNNER_SERVICE_ARN" \
+              --query 'Service.ServiceUrl' --output text)
+            echo "[$i/60] Status=$STATUS URL=$URL"
+            case "$STATUS" in
+              RUNNING)
+                echo "Service is RUNNING at https://$URL"
+                # Final health probe — fail the workflow if /health isn't 200.
+                if curl -fsS --max-time 10 "https://$URL/health" > /dev/null; then
+                  echo "Health check passed."
+                  exit 0
+                else
+                  echo "::warning::Service status is RUNNING but /health didn't return 200 yet — retrying."
+                fi
+                ;;
+              CREATE_FAILED|DELETE_FAILED|PAUSED)
+                echo "::error::Service in non-recoverable state: $STATUS"
+                exit 1
+                ;;
+            esac
+            sleep 15
+          done
+          echo "::error::App Runner did not stabilize within 15 minutes."
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Deploy summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: \`${{ steps.tags.outputs.ecr_uri }}:${{ steps.tags.outputs.sha_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Also tagged: \`:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- App Runner service: \`$APPRUNNER_SERVICE_ARN\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Triggered by: \`${{ github.event_name }}\` from \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY

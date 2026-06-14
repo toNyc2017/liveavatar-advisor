@@ -12,6 +12,29 @@ working in this folder will discover it automatically.
 
 ## Open items
 
+### Finish the App Runner deploy (manual steps remaining)
+
+**Identified:** 2026-06-13. Scaffolding committed; the rest is keys
+and clicks — see `infra/README.md` for the exact commands.
+
+What's still to do, in order:
+
+1. `aws ssm put-parameter` the four runtime secrets under
+   `/liveavatar-advisor/` (OPENAI, LIVEAVATAR, ELEVENLABS, optionally
+   DEEPGRAM).
+2. Deploy `infra/bootstrap-oidc.yaml` once per AWS account.
+3. Deploy `infra/apprunner.yaml`. Service will sit waiting for an
+   image — that's fine.
+4. Set the five GitHub repo Variables (`AWS_REGION`, `AWS_ACCOUNT_ID`,
+   `AWS_DEPLOY_ROLE_ARN`, `ECR_REPO_NAME`, `APPRUNNER_SERVICE_ARN`).
+5. `./scripts/seed_chroma_s3.sh` to upload the ChromaDB tarball to the
+   seed bucket.
+6. Push to `main` → first deploy runs end-to-end. The workflow waits
+   for `/health` to return 200 before turning green.
+
+Once `https://<id>.us-east-1.awsapprunner.com/health` is RUNNING, ngrok
+goes away and the rest of `TO_DO_IN_FUTURE.md` becomes the priority.
+
 ### Structured gap-summary store / tool
 
 **Identified:** 2026-05-26 (needs-vs-wants worldview update).
@@ -80,6 +103,16 @@ it spoken.
 
 ## Done (recent, for context)
 
+- 2026-06-13 — Production deploy scaffolding for AWS App Runner. New
+  `storage.py` abstracts USER.md/MEMORY.md/digest I/O behind a
+  `UserStorage` interface (local-disk in dev, S3 in prod). New
+  `_ensure_chroma_db_present()` hydrates ChromaDB from a seed tarball
+  at cold start. Added `Dockerfile`, `.dockerignore`,
+  `requirements-runtime.txt`, `infra/bootstrap-oidc.yaml`,
+  `infra/apprunner.yaml`, `infra/README.md`,
+  `.github/workflows/deploy-backend.yml`, and
+  `scripts/seed_chroma_s3.sh`. Auth via GitHub OIDC, secrets via SSM
+  Parameter Store, image tags `:latest` + `:sha-XXXX` for rollback.
 - 2026-05-26 — Voice and bearing pass: defined the avatar's voice
   recipe as Munger spine + Hanks acknowledgment + dry contextual wit
   inside a lively-but-corporate register. Added a Voice and bearing

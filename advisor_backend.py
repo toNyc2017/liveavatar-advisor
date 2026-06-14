@@ -35,6 +35,8 @@ import base64
 import re
 from elevenlabs import ElevenLabs
 from elevenlabs.types import VoiceSettings
+
+from storage import storage as user_storage
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -181,6 +183,9 @@ RAG_K = 4
 # Per-user memory (see MEMORY_SUBSYSTEM.md for the full design).
 USER_COOKIE_NAME = "liveavatar_user"
 USER_COOKIE_MAX_AGE = 60 * 60 * 24 * 365  # 1 year
+# USERS_DIR remains for backwards compatibility with scripts/compile_memory.py
+# CLI usage. Live runtime reads/writes go through storage.py instead, so we
+# can swap to S3 in production without touching this file.
 USERS_DIR = Path(_HERE) / "users"
 
 SYSTEM_PROMPT = """You are Tom Olds, a financial professional specializing in retirement planning
@@ -402,9 +407,71 @@ MAX_TURNS = 12
 
 _chroma_collection = None
 
+
+def _ensure_chroma_db_present():
+    """If CHROMA_PATH is empty and CHROMA_SEED_S3_URI is set, download +
+    extract the seed tarball from S3.
+
+    No-op when chroma_db/ already exists locally — which is the normal
+    case for `./run.sh` development. The hydration path only runs when
+    the container boots fresh in production (App Runner), where the
+    image ships without the vector store and we pull it from S3 on
+    cold start. Expected archive shape:
+
+        tar -czf chroma_db.tar.gz chroma_db/
+
+    extracted at the project root so it lands at ./chroma_db/.
+    """
+    p = Path(CHROMA_PATH)
+    if p.is_dir() and any(p.iterdir()):
+        return  # already hydrated (local dev or warm container)
+
+    seed_uri = os.getenv("CHROMA_SEED_S3_URI")
+    if not seed_uri:
+        log.warning(
+            "ChromaDB at %s is empty and CHROMA_SEED_S3_URI is not set — "
+            "RAG context retrieval will fail. In production, set "
+            "CHROMA_SEED_S3_URI to s3://bucket/key/chroma_db.tar.gz",
+            CHROMA_PATH,
+        )
+        return
+    if not seed_uri.startswith("s3://"):
+        log.error("CHROMA_SEED_S3_URI must look like s3://bucket/key, got %r", seed_uri)
+        return
+
+    bucket, _, key = seed_uri[len("s3://"):].partition("/")
+    log.info("Hydrating ChromaDB from s3://%s/%s ...", bucket, key)
+    import boto3
+    import tarfile
+    import tempfile
+
+    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-1"))
+    parent = os.path.dirname(CHROMA_PATH) or "."
+    with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        s3.download_file(bucket, key, tmp_path)
+        with tarfile.open(tmp_path, "r:gz") as tf:
+            tf.extractall(path=parent)
+        if p.is_dir() and any(p.iterdir()):
+            log.info("ChromaDB hydrated at %s", CHROMA_PATH)
+        else:
+            log.error(
+                "Tarball extracted but %s is still empty — check archive "
+                "shape (expected: tar -czf chroma_db.tar.gz chroma_db/)",
+                CHROMA_PATH,
+            )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def _get_chroma_collection():
     global _chroma_collection
     if _chroma_collection is None:
+        _ensure_chroma_db_present()
         ef = OpenAIEmbeddingFunction(
             api_key=os.getenv("OPENAI_API_KEY"),
             model_name="text-embedding-3-small",
@@ -509,20 +576,15 @@ def load_user_context(user_id: str) -> str:
     (no folder yet, or folder with neither file), returns the FIRST
     VISIT instruction block telling the avatar to greet and capture
     their name via the save_client_profile tool."""
-    user_dir = USERS_DIR / user_id
     parts: list[str] = []
 
-    if user_dir.exists():
-        user_md = user_dir / "USER.md"
-        memory_md = user_dir / "MEMORY.md"
-        if user_md.exists():
-            body = user_md.read_text(encoding="utf-8").strip()
-            if body:
-                parts.append("[About this person — durable facts]\n" + body)
-        if memory_md.exists():
-            body = memory_md.read_text(encoding="utf-8").strip()
-            if body:
-                parts.append("[Compiled memory from past conversations]\n" + body)
+    if user_storage.user_dir_exists(user_id):
+        profile = user_storage.read_profile(user_id)
+        if profile and profile.strip():
+            parts.append("[About this person — durable facts]\n" + profile.strip())
+        compiled = user_storage.read_compiled_memory(user_id)
+        if compiled and compiled.strip():
+            parts.append("[Compiled memory from past conversations]\n" + compiled.strip())
 
     if not parts:
         # First-time visitor — instruct the avatar to introduce itself
@@ -593,9 +655,6 @@ async def save_session_digest(user_id: str, turns: list[dict]) -> None:
     if not turns or user_id.startswith("anon-"):
         return
 
-    user_dir = USERS_DIR / user_id / "memory"
-    user_dir.mkdir(parents=True, exist_ok=True)
-
     transcript = "\n".join(
         f"{t['role'].upper()}: {t['content']}"
         for t in turns
@@ -624,9 +683,8 @@ async def save_session_digest(user_id: str, turns: list[dict]) -> None:
         return
 
     filename = now.strftime("%Y-%m-%d_%H-%M.md")
-    path = user_dir / filename
-    path.write_text(digest + "\n", encoding="utf-8")
-    log.info("Saved session digest for %s → %s", user_id, path)
+    user_storage.write_session_digest(user_id, filename, digest + "\n")
+    log.info("Saved session digest for %s → memory/%s", user_id, filename)
 
     # Chain in a compile pass so the NEXT session inherits this digest's
     # specifics via MEMORY.md. load_user_context reads USER.md +
@@ -648,8 +706,10 @@ async def compile_user_memory(user_id: str) -> bool:
     if not user_id or user_id.startswith("anon-"):
         return False
 
-    # Reuse the prompt + read/truncate helpers from the CLI compiler so
-    # this and `python scripts/compile_memory.py` produce identical files.
+    # Reuse the prompt + truncate helper from the CLI compiler so this
+    # and `python scripts/compile_memory.py` produce identical content.
+    # Digest reads themselves go through user_storage (S3-aware) rather
+    # than the CLI compiler's Path-based helper.
     import sys as _sys
     _scripts_dir = os.path.join(_HERE, "scripts")
     if _scripts_dir not in _sys.path:
@@ -659,7 +719,6 @@ async def compile_user_memory(user_id: str) -> bool:
             _SYNTHESIS_PROMPT,
             _HEADER,
             MAX_INPUT_CHARS,
-            _read_digests,
             _truncate,
         )
     except Exception:
@@ -667,12 +726,23 @@ async def compile_user_memory(user_id: str) -> bool:
                       "MEMORY.md will not be refreshed for %s", user_id)
         return False
 
-    user_dir = USERS_DIR / user_id
-    paths, raw = _read_digests(user_dir)
-    if not raw:
+    filenames = user_storage.list_session_digests(user_id)
+    if not filenames:
         return False
 
-    raw = _truncate(raw, MAX_INPUT_CHARS)
+    chunks: list[str] = []
+    for fn in filenames:
+        try:
+            body = user_storage.read_session_digest(user_id, fn).strip()
+        except Exception:
+            log.exception("Could not read session digest %s for %s", fn, user_id)
+            continue
+        if body:
+            chunks.append(f"=== {fn} ===\n{body}")
+    if not chunks:
+        return False
+
+    raw = _truncate("\n\n".join(chunks), MAX_INPUT_CHARS)
 
     try:
         completion = await aclient.chat.completions.create(
@@ -693,15 +763,13 @@ async def compile_user_memory(user_id: str) -> bool:
         return False
 
     when = datetime.now().strftime("%Y-%m-%d %H:%M")
-    n = len(paths)
+    n = len(filenames)
     header = _HEADER + (
         f"<!-- Generated {when} from {n} session "
         f"digest{'s' if n != 1 else ''} (auto-compiled by backend). -->\n\n"
     )
-    out_path = user_dir / "MEMORY.md"
-    out_path.write_text(header + body + "\n", encoding="utf-8")
-    log.info("Auto-compiled MEMORY.md for %s (%d digests → %s)",
-             user_id, n, out_path)
+    user_storage.write_compiled_memory(user_id, header + body + "\n")
+    log.info("Auto-compiled MEMORY.md for %s (%d digests)", user_id, n)
     return True
 
 
@@ -815,40 +883,34 @@ async def _generate_conversation_summary(user_id: str) -> dict:
         return {"error": "anonymous_user",
                 "message": "No saved profile or history for this visitor yet."}
 
-    user_dir = USERS_DIR / user_id
-    if not user_dir.exists():
+    if not user_storage.user_dir_exists(user_id):
         return {"error": "no_history",
                 "message": "Nothing on file for this visitor yet."}
 
     # Gather the source material the synthesis LLM will work from.
     sources: list[str] = []
     name_hint = ""
-    user_md = user_dir / "USER.md"
-    if user_md.exists():
-        body = user_md.read_text(encoding="utf-8").strip()
-        if body:
-            sources.append("=== USER.md (durable profile) ===\n" + body)
-            # Cheap parse for first name, used as a fallback if the LLM
-            # forgets to populate prepared_for.
-            for line in body.splitlines():
-                if "**Name:**" in line:
-                    name_hint = line.split("**Name:**", 1)[1].strip()
-                    break
-    memory_md = user_dir / "MEMORY.md"
-    if memory_md.exists():
-        body = memory_md.read_text(encoding="utf-8").strip()
-        if body:
-            sources.append("=== MEMORY.md (compiled history) ===\n" + body)
-    raw_dir = user_dir / "memory"
-    if raw_dir.exists():
-        digest_paths = sorted(raw_dir.glob("*.md"))[-10:]
-        for p in digest_paths:
-            try:
-                txt = p.read_text(encoding="utf-8").strip()
-                if txt:
-                    sources.append(f"=== Session digest {p.stem} ===\n" + txt)
-            except Exception:
-                log.exception("Could not read session digest %s", p)
+    profile = user_storage.read_profile(user_id)
+    if profile and profile.strip():
+        sources.append("=== USER.md (durable profile) ===\n" + profile.strip())
+        # Cheap parse for first name, used as a fallback if the LLM
+        # forgets to populate prepared_for.
+        for line in profile.splitlines():
+            if "**Name:**" in line:
+                name_hint = line.split("**Name:**", 1)[1].strip()
+                break
+    compiled = user_storage.read_compiled_memory(user_id)
+    if compiled and compiled.strip():
+        sources.append("=== MEMORY.md (compiled history) ===\n" + compiled.strip())
+    digest_filenames = user_storage.list_session_digests(user_id)[-10:]
+    for fn in digest_filenames:
+        try:
+            txt = user_storage.read_session_digest(user_id, fn).strip()
+            if txt:
+                stem = fn[:-3] if fn.endswith(".md") else fn
+                sources.append(f"=== Session digest {stem} ===\n" + txt)
+        except Exception:
+            log.exception("Could not read session digest %s for %s", fn, user_id)
 
     if not sources:
         return {"error": "no_history",
@@ -912,19 +974,15 @@ def save_user_profile(user_id: str, name: str, notes: str | None = None) -> dict
         # Anonymous (direct API call) — no folder to write to.
         return {"saved": False, "reason": "anonymous_user"}
 
-    user_dir = USERS_DIR / user_id
-    user_dir.mkdir(parents=True, exist_ok=True)
-    user_md = user_dir / "USER.md"
-
     name = name.strip()
     today = datetime.now().strftime("%Y-%m-%d")
 
     # Preserve the original first-met date if USER.md already exists;
     # only the name + notes update on rewrites.
     first_met = today
-    if user_md.exists():
+    existing = user_storage.read_profile(user_id)
+    if existing:
         try:
-            existing = user_md.read_text(encoding="utf-8")
             for line in existing.splitlines():
                 if line.strip().startswith("- **First met:**"):
                     first_met = line.split("**First met:**", 1)[1].strip()
@@ -942,7 +1000,7 @@ def save_user_profile(user_id: str, name: str, notes: str | None = None) -> dict
     if notes and notes.strip():
         body += f"\n## Notes\n\n{notes.strip()}\n"
 
-    user_md.write_text(body, encoding="utf-8")
+    user_storage.write_profile(user_id, body)
     log.info("Saved profile for %s (name=%r)", user_id, name)
     return {"saved": True, "name": name}
 
@@ -1568,7 +1626,7 @@ async def converse_stream(req: LlmReq, request: Request):
                             was_first_intro = (
                                 user_id
                                 and not user_id.startswith("anon-")
-                                and not (USERS_DIR / user_id / "USER.md").exists()
+                                and not user_storage.profile_exists(user_id)
                             )
                             result = _run_tool(
                                 "save_client_profile", args, user_id=user_id

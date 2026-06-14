@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One-time bootstrap for the LiveAvatar Advisor deploy pipeline.
+  Creates the GitHub OIDC provider (if missing) and an IAM role that
+  GitHub Actions in the configured repo can assume — no long-lived
+  AWS keys ever live in GitHub.
+
+  Deploy ONCE per AWS account. After this stack exists, the
+  apprunner.yaml stack and the deploy-backend.yml workflow can both
+  reference the role ARN it exports.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: toNyc2017
+    Description: GitHub org or user that owns the repo (no slashes).
+
+  GitHubRepo:
+    Type: String
+    Default: liveavatar-advisor
+    Description: GitHub repo name (no org prefix).
+
+  GitHubRefPattern:
+    Type: String
+    Default: "repo:toNyc2017/liveavatar-advisor:ref:refs/heads/main"
+    Description: >
+      OIDC subject pattern that's allowed to assume the role. Defaults
+      to pushes on main only. Widen (e.g.
+      "repo:toNyc2017/liveavatar-advisor:*") if you want PR builds or
+      other branches to deploy too.
+
+  ECRRepoName:
+    Type: String
+    Default: liveavatar-advisor
+    Description: ECR repo name (same as the one apprunner.yaml creates).
+
+  AppRunnerServiceName:
+    Type: String
+    Default: liveavatar-advisor
+    Description: App Runner service name (same as the one apprunner.yaml creates).
+
+  CreateOIDCProviderParam:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set to "false" if this AWS account already has the GitHub OIDC
+      provider from a previous project — only one is allowed per account.
+
+Conditions:
+  CreateOIDCProvider: !Equals [!Ref CreateOIDCProviderParam, "true"]
+
+Resources:
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # GitHub rotates these — current values per
+      # https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # Role that GitHub Actions assumes via OIDC during the workflow.
+  # Scoped tightly to: ECR push for our one repo + App Runner deploy
+  # for our one service. Nothing else.
+  GitHubActionsDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-github-actions"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOIDCProvider
+                - !Ref GitHubOIDCProvider
+                - !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+              StringLike:
+                "token.actions.githubusercontent.com:sub": !Ref GitHubRefPattern
+      Policies:
+        - PolicyName: ecr-push
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:DescribeRepositories
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepoName}"
+        - PolicyName: apprunner-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - apprunner:StartDeployment
+                  - apprunner:DescribeService
+                  - apprunner:ListServices
+                Resource: !Sub "arn:aws:apprunner:${AWS::Region}:${AWS::AccountId}:service/${AppRunnerServiceName}/*"
+        - PolicyName: s3-chroma-seed-upload
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Lets a future scheduled-re-ingest workflow push a new
+              # chroma_db.tar.gz to the seed bucket. Local-from-laptop
+              # use of seed_chroma_s3.sh doesn't need this — it uses
+              # your own AWS profile.
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::liveavatar-advisor-*/*"
+
+Outputs:
+  DeployRoleArn:
+    Description: ARN to paste into the GitHub workflow as AWS_DEPLOY_ROLE_ARN.
+    Value: !GetAtt GitHubActionsDeployRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DeployRoleArn"

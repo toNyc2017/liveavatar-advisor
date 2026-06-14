@@ -1,0 +1,23 @@
+# Runtime-only dependencies for the Docker image.
+#
+# These are the packages advisor_backend.py + storage.py actually import
+# at runtime. The full requirements.txt includes additional packages used
+# only by offline tooling (mediapipe + opencv for background replacement,
+# yt-dlp / feedparser for podcast ingestion, python-pptx for the deck
+# generator, etc.) which would bloat the container image without serving
+# the running app.
+#
+# When you add or remove a runtime dependency, update both files.
+
+fastapi>=0.115
+uvicorn[standard]>=0.32
+httpx>=0.28
+
+python-dotenv>=1.0
+
+openai>=1.50
+elevenlabs>=1.10
+chromadb>=0.4
+
+# AWS — used by storage.py's S3 backend + ChromaDB cold-start hydration
+boto3>=1.34

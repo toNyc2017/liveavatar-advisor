@@ -11,6 +11,12 @@ openai>=1.50
 elevenlabs>=1.10
 chromadb>=0.4
 
+# AWS SDK — used by storage.py's S3 backend and by the ChromaDB
+# cold-start hydration. Lazily imported, so a local dev session that
+# never sets USERS_STORAGE_BACKEND=s3 or CHROMA_SEED_S3_URI never
+# pays the import cost.
+boto3>=1.34
+
 # Document parsing (used by ingest scripts for .docx)
 python-docx>=1.1
 

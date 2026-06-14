@@ -1,0 +1,84 @@
+# Mirror of .gitignore plus virtualenv + large/personal source assets
+# that would bloat the image or leak data.
+#
+# Anything in this file is NOT copied into the build context, so Docker
+# never sees it — `docker build` is faster AND the resulting image is
+# smaller AND we can't accidentally ship secrets or user data.
+
+# Secrets — never in the image
+.env
+.tavus_info
+.liveavatar_info
+.heygen_info
+
+# Local Python environment (huge, host-specific)
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS junk
+.DS_Store
+
+# Per-visitor memory — production reads/writes go through S3
+users/
+
+# Vector store — production hydrates from S3 seed at cold start
+chroma_db/
+
+# Source corpus + offline pipeline artifacts — not needed at runtime
+annuity_docs/
+podcast_audio/
+natebjones/
+moonshots/
+deliverables/
+financialplanningexplained/
+andrewhuberman/
+
+# Access logs / debug artifacts
+logs/
+
+# Training / source videos and frames — large, personal
+*.MOV
+*.mov
+*.mp4
+*.MP4
+*.m4a
+*.jpg
+*.png
+*.pdf
+*.docx
+*.pages
+
+# VCS, editors, IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+.claude/
+
+# Project memory + docs (not needed at runtime)
+SOUL.md
+HANDOFF.md
+SESSION_NOTES.md
+MEMORY_SUBSYSTEM.md
+MEMORY_BACKEND_PROPOSAL.md
+OPENCLAW_OVERVIEW.md
+OPENCLAW_SETUP.md
+PROJECT_DESCRIPTION.md
+README.md
+TO_DO_IN_FUTURE.md
+HOW_TO_GENERATE_SCRIPTED_VIDEO.md
+CLAUDE.md
+
+# Container artifacts from previous builds
+Dockerfile
+.dockerignore
+infra/
+
+# Frontend deploy + GitHub Actions are not container payload
+.github/
+
+# Drafts / scratch
+drafts/

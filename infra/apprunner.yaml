@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  LiveAvatar Advisor — App Runner service + supporting AWS resources.
+
+  Provisions:
+    * ECR private repo for the backend image
+    * S3 bucket for per-visitor memory (users/<id>/USER.md, MEMORY.md,
+      memory/<ts>.md) — written/read by storage.py S3UserStorage
+    * S3 bucket for the ChromaDB cold-start seed tarball
+    * IAM access role (ECR pull) and instance role (S3 + SSM) for App Runner
+    * App Runner service with auto-deploy on ECR :latest push
+    * Health check on GET /health
+    * Env vars + secret references (secrets live in SSM Parameter Store)
+
+  Secrets are NOT created by this stack. Before first deploy, put them
+  in SSM Parameter Store as SecureStrings — see infra/README.md.
+
+Parameters:
+  DeployService:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Set to "true" only after a :latest image exists in ECR. On first
+      deploy, leave as "false" to create ECR + S3 + IAM without the App
+      Runner service; push the first image; then re-deploy with "true".
+
+  ServiceName:
+    Type: String
+    Default: liveavatar-advisor
+    Description: App Runner service name + prefix for related resources.
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: >
+      ECR image tag App Runner watches. Stay on "latest" so auto-deploy
+      on ECR push works; pin to a sha-XXXXXX tag temporarily if you need
+      to freeze rollouts during an incident.
+
+  Cpu:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+    Description: App Runner CPU units. 1024 = 1 vCPU.
+
+  Memory:
+    Type: String
+    Default: "2048"
+    AllowedValues: ["512", "1024", "2048", "3072", "4096", "6144", "8192", "10240", "12288"]
+    Description: App Runner memory (MB). ChromaDB + embeddings want 2GB minimum.
+
+  LLMModel:
+    Type: String
+    Default: gpt-5.4
+    Description: Value of the LLM_MODEL env var.
+
+  ElevenLabsVoiceId:
+    Type: String
+    Default: 8gfvBkrqr64Si4V5Q321
+    Description: Voice id for Tom's ElevenLabs clone.
+
+  HeyGenAvatarId:
+    Type: String
+    Default: e5953f75-f0b8-45b5-9bbc-b8b8c591d029
+    Description: Active LiveAvatar id (currently the "books" variant).
+
+  ChromaSeedKey:
+    Type: String
+    Default: chroma_db.tar.gz
+    Description: S3 key inside the seed bucket for the ChromaDB tarball.
+
+  SecretsPathPrefix:
+    Type: String
+    Default: /liveavatar-advisor
+    Description: >
+      Root path in SSM Parameter Store for runtime secrets. The stack
+      references children like ${SecretsPathPrefix}/OPENAI_API_KEY.
+
+Conditions:
+  ShouldDeployService: !Equals [!Ref DeployService, "true"]
+
+Resources:
+
+  # ---------------------------------------------------------------
+  # ECR — image source
+  # ---------------------------------------------------------------
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref ServiceName
+      ImageTagMutability: MUTABLE   # we mutate "latest" on every push
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        # Keep the last 10 sha-tagged images for rollback; expire older
+        # untagged layers aggressively.
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 sha-tagged images",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPatternList": ["sha-*"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Expire untagged after 7 days",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # ---------------------------------------------------------------
+  # S3 — per-visitor memory + Chroma seed
+  # ---------------------------------------------------------------
+  UsersBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain   # never auto-delete client conversation history
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ServiceName}-users-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+
+  ChromaSeedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ServiceName}-chroma-seed-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  # ---------------------------------------------------------------
+  # IAM — App Runner access role (lets the service pull the ECR image)
+  # ---------------------------------------------------------------
+  AppRunnerAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ServiceName}-apprunner-access"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: build.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+
+  # ---------------------------------------------------------------
+  # IAM — App Runner instance role (what the container itself can do)
+  # Granted: read/write to the users bucket, read from the chroma seed
+  # bucket, read SSM parameters under our path prefix.
+  # ---------------------------------------------------------------
+  AppRunnerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ServiceName}-apprunner-instance"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: tasks.apprunner.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: users-bucket-rw
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${UsersBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt UsersBucket.Arn
+        - PolicyName: chroma-seed-ro
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "${ChromaSeedBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt ChromaSeedBucket.Arn
+        - PolicyName: ssm-secrets-ro
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPathPrefix}/*"
+
+  # ---------------------------------------------------------------
+  # App Runner service
+  # ---------------------------------------------------------------
+  Service:
+    Type: AWS::AppRunner::Service
+    Condition: ShouldDeployService
+    DependsOn:
+      - EcrRepo            # repo must exist before service can reference an image inside it
+      - UsersBucket
+      - ChromaSeedBucket
+    Properties:
+      ServiceName: !Ref ServiceName
+      SourceConfiguration:
+        AutoDeploymentsEnabled: true
+        AuthenticationConfiguration:
+          AccessRoleArn: !GetAtt AppRunnerAccessRole.Arn
+        ImageRepository:
+          ImageRepositoryType: ECR
+          ImageIdentifier: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ServiceName}:${ImageTag}"
+          ImageConfiguration:
+            Port: "8000"
+            RuntimeEnvironmentVariables:
+              - Name: USERS_STORAGE_BACKEND
+                Value: s3
+              - Name: USERS_S3_BUCKET
+                Value: !Ref UsersBucket
+              - Name: USERS_S3_PREFIX
+                Value: users
+              - Name: CHROMA_SEED_S3_URI
+                Value: !Sub "s3://${ChromaSeedBucket}/${ChromaSeedKey}"
+              - Name: AWS_REGION
+                Value: !Ref AWS::Region
+              - Name: LLM_MODEL
+                Value: !Ref LLMModel
+              - Name: ELEVENLABS_VOICE_ID
+                Value: !Ref ElevenLabsVoiceId
+              - Name: HEYGEN_AVATAR_ID
+                Value: !Ref HeyGenAvatarId
+              - Name: LIVEAVATAR_MODE
+                Value: LITE
+            # Secrets — App Runner resolves these from SSM at container
+            # start and injects them as plain env vars (the app code
+            # doesn't know the difference).
+            RuntimeEnvironmentSecrets:
+              - Name: OPENAI_API_KEY
+                Value: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPathPrefix}/OPENAI_API_KEY"
+              - Name: LIVEAVATAR_API_KEY
+                Value: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPathPrefix}/LIVEAVATAR_API_KEY"
+              - Name: ELEVENLABS_API_KEY
+                Value: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPathPrefix}/ELEVENLABS_API_KEY"
+              - Name: DEEPGRAM_API_KEY
+                Value: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SecretsPathPrefix}/DEEPGRAM_API_KEY"
+      InstanceConfiguration:
+        Cpu: !Ref Cpu
+        Memory: !Ref Memory
+        InstanceRoleArn: !GetAtt AppRunnerInstanceRole.Arn
+      HealthCheckConfiguration:
+        Protocol: HTTP
+        Path: /health
+        Interval: 10
+        Timeout: 5
+        HealthyThreshold: 1
+        UnhealthyThreshold: 5
+      NetworkConfiguration:
+        EgressConfiguration:
+          EgressType: DEFAULT
+        IngressConfiguration:
+          IsPubliclyAccessible: true
+
+Outputs:
+  ServiceUrl:
+    Condition: ShouldDeployService
+    Description: Public URL App Runner assigns to the service.
+    Value: !Sub "https://${Service.ServiceUrl}"
+
+  EcrRepoUri:
+    Description: ECR repo URI — paste into the deploy-backend workflow.
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ServiceName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-EcrRepoUri"
+
+  EcrRepoName:
+    Description: ECR repo name (short form).
+    Value: !Ref EcrRepo
+
+  UsersBucketName:
+    Description: S3 bucket holding per-visitor memory.
+    Value: !Ref UsersBucket
+
+  ChromaSeedBucketName:
+    Description: S3 bucket holding the ChromaDB cold-start tarball.
+    Value: !Ref ChromaSeedBucket
+
+  ChromaSeedUri:
+    Description: Full s3:// URI for the Chroma seed (also set as env var on the service).
+    Value: !Sub "s3://${ChromaSeedBucket}/${ChromaSeedKey}"
+
+  AppRunnerServiceArn:
+    Condition: ShouldDeployService
+    Description: Service ARN — used by the deploy workflow's StartDeployment call.
+    Value: !GetAtt Service.ServiceArn
+    Export:
+      Name: !Sub "${AWS::StackName}-ServiceArn"
