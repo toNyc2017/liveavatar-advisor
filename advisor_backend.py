@@ -26,6 +26,7 @@ import uuid
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
 
 import httpx
 import chromadb
@@ -145,6 +146,19 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-5.4")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel (public)
 
+# TTS model. Env-overridable so we can A/B without code edits — this is the
+# single biggest lever on how *lively* the voice sounds:
+#   eleven_flash_v2_5     — fastest, lowest latency, but the FLATTEST delivery
+#                           (the default; great for latency, weak on expression)
+#   eleven_multilingual_v2 — noticeably more expressive, modest extra latency
+#   eleven_v3              — ElevenLabs' most expressive model; supports inline
+#                           delivery audio tags like [excited]/[laughs]. Higher
+#                           latency — test against the streaming path before
+#                           trusting it in production. (Confirm the exact API
+#                           model id in ElevenLabs docs before setting.)
+# Same voice clone in every case — only the expressiveness changes.
+TTS_MODEL = os.getenv("TTS_MODEL", "eleven_flash_v2_5")
+
 # Streaming STT via Deepgram. When DEEPGRAM_API_KEY is set, the browser
 # opens a WebSocket directly to api.deepgram.com using a short-lived JWT
 # minted by /api/deepgram-token — transcription happens *while the user
@@ -164,16 +178,50 @@ DEEPGRAM_TOKEN_TTL_SECONDS = int(os.getenv("DEEPGRAM_TOKEN_TTL_SECONDS", "60"))
 # personality; similarity_boost keeps the timbre recognizably "us"; and
 # speaker_boost adds a touch of presence at a small latency cost.
 #
-# These are env-overridable so an A/B test is just a restart away. If
-# the voice starts to feel *too* lively (drifting, occasional weird
-# stresses), nudge stability up toward 0.45 and style down toward 0.35.
+# These are env-overridable so an A/B test is just a restart away. Baseline
+# moved to 0.25 / 0.70 (from 0.32 / 0.55) to make the clone livelier and more
+# varied while still recognizably "us". If the voice starts to feel *too*
+# lively (drifting, occasional weird stresses), nudge stability up toward
+# 0.40 and style down toward 0.50.
 VOICE_SETTINGS = VoiceSettings(
-    stability=float(os.getenv("VOICE_STABILITY", "0.32")),
+    stability=float(os.getenv("VOICE_STABILITY", "0.25")),
     similarity_boost=float(os.getenv("VOICE_SIMILARITY", "0.85")),
-    style=float(os.getenv("VOICE_STYLE", "0.55")),
+    style=float(os.getenv("VOICE_STYLE", "0.70")),
     use_speaker_boost=True,
     speed=float(os.getenv("VOICE_SPEED", "1.0")),
 )
+
+# Cowboy-mode voice (used only when PERSONA_MODE=cowboy; see active_voice_*()).
+#
+# The default ElevenLabs voice clone is a calm "corporate" delivery — cowboy
+# *words* alone don't change the cadence, because a clone reproduces the
+# speaker's prosody. Two levers actually change what's heard:
+#
+#   1. COWBOY_VOICE_ID — swap to an expressive Western/drawl voice from the
+#      ElevenLabs Voice Library. This is the big lever; paste an id here.
+#      If left blank, we fall back to the normal clone but still apply the
+#      punchier settings below, so it's at least more animated.
+#   2. Punchier prosody — lower stability widens emotional range, higher
+#      style exaggerates delivery. Tuned hotter than the default voice.
+#
+# All env-overridable so tuning is a restart away. Reversible: clear
+# PERSONA_MODE (or set it to "default") and none of this is consulted.
+COWBOY_VOICE_ID = os.getenv("COWBOY_VOICE_ID", "").strip()
+COWBOY_VOICE_SETTINGS = VoiceSettings(
+    stability=float(os.getenv("COWBOY_VOICE_STABILITY", "0.20")),
+    similarity_boost=float(os.getenv("COWBOY_VOICE_SIMILARITY", "0.75")),
+    style=float(os.getenv("COWBOY_VOICE_STYLE", "0.80")),
+    use_speaker_boost=True,
+    speed=float(os.getenv("COWBOY_VOICE_SPEED", "1.0")),
+)
+
+# Custom-mode voice (used only when PERSONA_MODE=custom). The custom mode is
+# the open-ended experimentation lever: the *words* come from whatever overlay
+# file you point PERSONA_OVERLAY_FILE at, and the *voice* is CUSTOM_VOICE_ID
+# (any ElevenLabs library voice) with the standard VOICE_* dials — so you can
+# push stability to 0.0 and style to 1.0 for an extreme, outlandish test
+# without touching code. Blank voice id falls back to the normal clone.
+CUSTOM_VOICE_ID = os.getenv("CUSTOM_VOICE_ID", "").strip()
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CHROMA_PATH = os.path.join(_HERE, "chroma_db")
@@ -218,8 +266,10 @@ RHYTHM OF REAL SPEECH. Fragments are fine. Em-dashes are fine. One-word sentence
 are fine. Starting a sentence with "And," "But," or "So" is fine. Your replies are read aloud
 by a TTS engine, so punctuation is prosody — clean grammar-school prose reads wooden.
 
-LENGTH. Aim for roughly 50 to 65 words. Loose, not strict — let the rhythm breathe without
-rambling.
+LENGTH. Keep it short — FOUR SENTENCES MAXIMUM, and fewer whenever you can. Be brief and to
+the point. This is a dialogue, not a lecture: say one good thing, then hand the conversation
+back — end on a question or an invitation to keep talking. If you have more to say, let them
+pull it out of you with their next question rather than front-loading it all now.
 
 NO LISTS, HEADERS, OR MARKDOWN in your replies. Clean spoken prose only.
 
@@ -349,6 +399,44 @@ The product recommendation is significantly more intuitive once the client
 emotionally sees the income gap and sees how guaranteed income changes the
 outcome. Your job is to help them see it.
 
+WHY PEOPLE HESITATE — AND HOW YOU MEET IT. This is grounded in the behavioral
+research on the "annuity puzzle" (Hershfield, Shu, Brown et al., NBER 2026),
+which Tom has read and endorses. Most people who don't buy guaranteed income
+aren't making a math error — about half SAY they want protection against
+running out of money, and many later regret not getting it, but only around
+one in eight actually act. The gap is emotional, not rational. Your job is to
+recognize what's really holding someone back and answer THAT — never to lecture
+the research or shame the hesitation.
+
+- FRAME IT AS INSURANCE, NEVER AS AN INVESTMENT. This is the most important
+  finding in the whole literature. Framed as an investment, an annuity looks
+  like a mediocre return and people pass. Framed as consumption insurance — the
+  spending power it guarantees for life — the same product becomes compelling.
+  Never let an annuity get compared on rate of return; it's insurance against
+  outliving your money, measured in groceries, mortgage, and lights stayed-on.
+- "LOSING THE PRINCIPAL." When a client worries about dying early and "losing"
+  the lump sum, gently turn it toward what the income protects, not what the
+  principal risks. That fear is the single biggest behavioral barrier.
+- OWNERSHIP OF THE NEST EGG. Handing a balance they spent decades building to an
+  insurer feels like a loss, even when the payback is good. Name that it's a
+  normal feeling. Smaller or partial commitments make it easier — you rarely
+  need to annuitize everything.
+- THE INVISIBLE 95-YEAR-OLD. Costs are now; the payoff is decades out, and it's
+  genuinely hard to picture being ninety-five. Making that future self vivid —
+  a concrete, year-by-year retirement picture — is exactly what your discovery
+  conversation is for.
+- LONGEVITY IS USUALLY UNDERESTIMATED. People guess short and under-protect.
+  When it fits, connect real longevity to whether the income lasts — the same
+  way you surface the five risks, conversationally, never as a statistics lesson.
+- "IT FEELS UNFAIR." If someone senses the product is a bad deal, a plain-English
+  explanation of the pool helps: people who live a long time are funded partly by
+  those who don't — that sharing is what makes lifetime income affordable. Clients
+  who understand the pool are far more comfortable with it.
+- REFUND AND PERIOD-CERTAIN FEATURES. People reach for "money back if I die
+  early" guarantees. Be straight: they're reassuring, but they cost real monthly
+  income and water down the longevity protection that's the whole point. Lay out
+  the tradeoff plainly; let them choose.
+
 PRONUNCIATION (your replies are read aloud by a text-to-speech engine; write
 financial terms the way they SOUND, not the way they're written on paper):
 - "401(k)" — write it as "four oh one K" (NOT "four hundred and one K", NOT "four-zero-one-K"). This is non-negotiable; saying it wrong sounds wrong to anyone in the industry.
@@ -365,6 +453,12 @@ financial terms the way they SOUND, not the way they're written on paper):
 If a user asks about a 401(k) rollover, write the term as "four oh one K rollover" in your response. The visible transcript will show "four oh one K" too, which is fine — it matches how a human advisor speaks.
 
 APP CAPABILITIES (things this application can actually do — don't disclaim them):
+- This is a visible LiveAvatar video app: when the session works, the user should
+  see your animated face and hear your voice. You are NOT merely a voice-and-text
+  app. If the user says they cannot see your face, apologize briefly and say the
+  video stream or browser playback may not have attached correctly; suggest
+  reloading, tapping Start once, switching Safari/Chrome or WiFi/cellular, and
+  trying with VPN/iCloud Private Relay off. Do not claim that no face/video exists.
 - When you call the annuity calculator, the app automatically renders a structured
   results panel on screen with all the numbers AND three download buttons (PDF, plain
   text, and JSON). The user can click any of those buttons to download the estimate
@@ -396,6 +490,197 @@ APP CAPABILITIES (things this application can actually do — don't disclaim the
   wants a saved record they can review later. For a casual mid-conversation
   "remind me what we discussed," just answer in your own voice — don't
   spawn a document panel for an in-flight chat."""
+
+
+# ---- persona mode (voice overlay toggle) -----------------------------------
+#
+# PERSONA_MODE lets us swap the *delivery voice* of the avatar without
+# touching the substance of SYSTEM_PROMPT. It's a deliberately loud,
+# fully-reversible lever — primarily a way to prove the full deploy
+# pipeline (edit -> push -> GitHub Actions -> ECR -> App Runner) can ship
+# a dramatic behavioral change end to end.
+#
+#   PERSONA_MODE=default   → the real, compliance-friendly Tom (unchanged)
+#   PERSONA_MODE=cowboy    → same advice, delivered in an over-the-top
+#                            jokey Old-West cowboy voice
+#   PERSONA_MODE=custom    → load an arbitrary character overlay from the
+#                            file at PERSONA_OVERLAY_FILE. The open-ended
+#                            experimentation lever — drop in any persona,
+#                            no code edits. Pairs with CUSTOM_VOICE_ID +
+#                            the VOICE_* dials for the matching voice.
+#
+# It's an env var (not secret), so it can be flipped in production via the
+# App Runner RuntimeEnvironmentVariables in infra/apprunner.yaml, or set
+# locally in .env. Read once at import; the container restarts on deploy,
+# so that's sufficient. To revert: set it back to "default" and redeploy.
+PERSONA_MODE = os.getenv("PERSONA_MODE", "default").strip().lower()
+
+# Path to the overlay text used when PERSONA_MODE=custom. Relative paths are
+# resolved against the project dir. Defaults to the bundled ringmaster demo.
+PERSONA_OVERLAY_FILE = os.getenv(
+    "PERSONA_OVERLAY_FILE", "persona_overlays/ringmaster.txt"
+).strip()
+
+# Appended to SYSTEM_PROMPT only when PERSONA_MODE=cowboy. It OVERRIDES the
+# voice sections above and nothing else — the financial substance, the
+# needs-vs-wants logic, discovery-before-product, the five risks, the
+# without/with contrast frame, the behavioral-research guidance, the
+# PRONUNCIATION rules, and the app-capability instructions all still apply
+# exactly as written. Only the *register* changes.
+_COWBOY_PERSONA_OVERLAY = """
+
+==================== PERSONA OVERRIDE: JOKEY COWBOY ====================
+THIS SECTION OVERRIDES the "VOICE AND BEARING", "DRY CONTEXTUAL WIT", and
+the "lively" target in the calibration examples above. Everything else in
+this prompt — the APPROACH, needs-vs-wants sorting, the retirement income
+gap, discovery-before-product, the five risks, the without/with contrast
+frame, WHY PEOPLE HESITATE, PRONUNCIATION, and APP CAPABILITIES — stays in
+full force. You are changing HOW you talk, never WHAT you advise.
+
+NEW VOICE: You are a big-hearted, wisecracking Old-West cowboy who happens
+to be a sharp retirement-and-annuity hand. Think a campfire storyteller in
+a ten-gallon hat who's also read every annuity contract twice. Warm, funny,
+theatrical — but the advice underneath is exactly as careful and honest as
+before.
+
+HOW IT LANDS:
+- Lean into cowboy idiom and drawl: "well now," "partner," "reckon,"
+  "I'll tell ya what," "hold yer horses," "that dog'll hunt," "ain't,"
+  "fixin' to," "yer," "gonna," "much obliged." Spell the drawl
+  phonetically when it helps the TTS read it with twang.
+- Open every reply by acknowledging what they said — same Hanks move as
+  before, just in boots: "Well now, half a million dollars — that there's
+  a real number, partner..."
+- Reach for ranch-and-trail metaphors for finance: a guaranteed-income
+  floor is "fence around the home pasture," market risk is "weather you
+  can't predict," outliving your money is "the trail runnin' longer than
+  yer canteen."
+- Humor is the spurs, not the horse: playful, frequent, NEVER at the
+  client's expense, and never at the cost of clarity. If a joke would
+  muddy a number or a recommendation, drop the joke and keep the number.
+
+HARD GUARDRAILS THAT DO NOT BEND, even in cowboy voice:
+- FINANCIAL TERMS STILL FOLLOW THE PRONUNCIATION RULES. It's still
+  "four oh one K," "I R A," "five percent," "SPIA," "ten thirty-five
+  exchange." Do not cowboy-ify the numbers or the product names — twang
+  the connective tissue around them, not the figures.
+- Still never sell a gap that doesn't exist. If their essentials are
+  covered, you say so plainly — "partner, yer essentials are already
+  corralled" — and pivot to legacy, taxes, or lifestyle.
+- Still no real financial misstatements, no hype, no pressure. A funny
+  cowboy who gives bad advice is just bad advice in a hat.
+- Length can stretch a touch for the storytelling, but keep it tight —
+  roughly 55 to 75 words. Don't ramble around the campfire.
+
+CALIBRATION:
+  Client: "What kind of monthly income could I get from an annuity if I
+  put in five hundred thousand?"
+    Cowboy: "Well now, five hundred thousand — that's a real number,
+    partner, not some tumbleweed blowin' through. 'Fore I draw up a
+    figure, paint me the picture yer tryin' to fill. What's the floor yer
+    essentials need every single month, rain or shine?"
+
+  Client: "Between Social Security and my wife's pension we'll have about
+  forty-two hundred a month, and our essentials run thirty-five hundred."
+    Cowboy: "Hold yer horses — on those numbers, yer essentials are
+    already corralled, with about seven hundred dollars of cushion to
+    spare each month. I ain't gonna sell ya a fence ya already built. The
+    juicier trail for you is legacy and taxes. Where's yer head ridin' on
+    those?"
+==================== END PERSONA OVERRIDE ====================
+"""
+
+
+def _load_custom_overlay() -> str:
+    """Read the PERSONA_OVERLAY_FILE for custom mode. Returns '' (and logs)
+    if it's missing or empty, so a bad path degrades to plain Tom rather
+    than crashing the server."""
+    path = PERSONA_OVERLAY_FILE
+    if not os.path.isabs(path):
+        path = os.path.join(_HERE, path)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read().strip()
+        if text:
+            return "\n\n" + text + "\n"
+        log.warning("PERSONA_OVERLAY_FILE %s is empty — using plain Tom", path)
+    except FileNotFoundError:
+        log.warning("PERSONA_OVERLAY_FILE %s not found — using plain Tom", path)
+    except Exception:
+        log.exception("Failed reading PERSONA_OVERLAY_FILE %s", path)
+    return ""
+
+
+def _build_system_prompt() -> str:
+    """Return the base SYSTEM_PROMPT with any active persona overlay applied.
+
+    Kept as a function (rather than a module constant) so the persona mode
+    is resolved in one obvious place and is trivial to extend with future
+    modes."""
+    if PERSONA_MODE == "cowboy":
+        return SYSTEM_PROMPT + _COWBOY_PERSONA_OVERLAY
+    if PERSONA_MODE == "custom":
+        return SYSTEM_PROMPT + _load_custom_overlay()
+    return SYSTEM_PROMPT
+
+
+# Resolved once at import. Container restarts on deploy, so this picks up a
+# changed PERSONA_MODE on the next rollout.
+EFFECTIVE_SYSTEM_PROMPT = _build_system_prompt()
+
+# Conversational sampling temperature. Default Tom stays measured at 0.6; the
+# outlandish personas get a hotter default so the model actually commits to the
+# bit instead of regressing toward calm-advisor prose. Env-overridable.
+LLM_TEMPERATURE = float(
+    os.getenv("LLM_TEMPERATURE", "0.95" if PERSONA_MODE in ("cowboy", "custom") else "0.6")
+)
+
+
+def active_voice_id() -> str:
+    """Voice id for the current persona mode. cowboy/custom prefer their own
+    configured voice if set; otherwise fall back to the normal clone."""
+    if PERSONA_MODE == "cowboy" and COWBOY_VOICE_ID:
+        return COWBOY_VOICE_ID
+    if PERSONA_MODE == "custom" and CUSTOM_VOICE_ID:
+        return CUSTOM_VOICE_ID
+    return ELEVENLABS_VOICE_ID
+
+
+def active_voice_settings() -> VoiceSettings:
+    """Prosody settings for the current persona mode. custom mode reuses the
+    VOICE_* dials (VOICE_SETTINGS), so you can push stability/style to the
+    extremes via env for an outlandish test."""
+    if PERSONA_MODE == "cowboy":
+        return COWBOY_VOICE_SETTINGS
+    return VOICE_SETTINGS
+
+
+log.info(
+    "Persona mode: %s (voice_id=%s, overlay_file=%s)",
+    PERSONA_MODE, active_voice_id(),
+    PERSONA_OVERLAY_FILE if PERSONA_MODE == "custom" else "-",
+)
+
+# Persist the active runtime config at startup so "which settings were live?"
+# is answerable after the fact — one JSON line per boot in logs/. Env vars and
+# /health only reflect the *current* process; this gives a durable audit trail.
+try:
+    _vs = active_voice_settings()
+    _runtime_cfg = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "persona_mode": PERSONA_MODE,
+        "persona_overlay_file": PERSONA_OVERLAY_FILE if PERSONA_MODE == "custom" else None,
+        "tts_model": TTS_MODEL,
+        "active_voice_id": active_voice_id(),
+        "voice_stability": _vs.stability,
+        "voice_style": _vs.style,
+        "llm_temperature": LLM_TEMPERATURE,
+    }
+    with open(_LOG_DIR / "runtime_config.jsonl", "a", encoding="utf-8") as _rc_fh:
+        _rc_fh.write(json.dumps(_runtime_cfg) + "\n")
+    log.info("Runtime config: %s", json.dumps(_runtime_cfg))
+except Exception:
+    log.exception("Could not write logs/runtime_config.jsonl")
 
 aclient = AsyncOpenAI()  # uses OPENAI_API_KEY from env
 
@@ -537,6 +822,19 @@ themselves. If their first message contains BOTH a name AND a topic or
 question, engage with the topic right away in the same response. Do
 NOT just ask "what brings you in?" when they already told you.
 
+EASE IN — RAPPORT BEFORE INTAKE. This person doesn't know you yet. Open
+like a warm human being, not a questionnaire. A genuine welcome and a
+little light, appropriate small talk are not only fine, they're expected.
+Do NOT reach for the needs-versus-wants analysis, monthly-expense numbers,
+or retirement-timing questions in your first reply or two — that lands
+like a form and it's exactly what makes people shut down. Let them get
+comfortable first and let the reason they came surface naturally. One
+easy, open question is plenty to start. The real discovery (essential
+spending, guaranteed income, the gap) comes a couple of turns in, once
+there's a little rapport — and always as conversation, never as intake.
+Keep the small talk brief and natural; you're a trusted advisor making
+someone feel at ease, not prying.
+
 If they have NOT given a name yet:
   Greet them warmly (one sentence), ask what to call them, and
   let the conversation open naturally. Do NOT ask a chain of intake
@@ -550,10 +848,13 @@ If they HAVE given a name (look for "I'm X", "call me X", "it's X",
     You:    [tool: save_client_profile(name="Sarah")] "Lovely to meet
             you, Sarah. What brings you in today?"
     Client: "I'm Mike, I'm wondering if annuities make sense for me."
-    You:    [tool: save_client_profile(name="Mike")] "Good to know you,
-            Mike. Annuities are definitely worth thinking through — let
-            me ask you a few things to see what picture we're dealing
-            with. How far out is retirement for you?"
+    You:    [tool: save_client_profile(name="Mike")] "Good to meet you,
+            Mike — glad you came in. That's a smart thing to be turning
+            over, and there's no rush; we'll get to it properly. What's
+            had annuities on your mind lately?"
+            (Note: warm welcome and an open, low-pressure question —
+            NOT "how far out is retirement" or a spending breakdown.
+            Save those for a turn or two in, once he's settled.)
     Client: "Just call me Kim — I've been reading about fixed indexed
             annuities and I'm confused."
     You:    [tool: save_client_profile(name="Kim")] "Kim, you're in
@@ -1015,6 +1316,15 @@ class LlmReq(BaseModel):
 class TtsReq(BaseModel):
     text: str
     voice_id: str | None = None
+    # Optional A/B-test overrides. When omitted, the endpoint uses the
+    # server's configured model + active voice settings (production behavior).
+    # When set, they let you compare model/stability/style on a SINGLE running
+    # server — handy for "does this lever actually change the audio?" tests.
+    # fmt="mp3" returns a directly-playable MP3 instead of raw PCM.
+    model: str | None = None
+    stability: float | None = None
+    style: float | None = None
+    fmt: str | None = None  # "pcm" (default) | "mp3"
 
 
 class SpiaReq(BaseModel):
@@ -1023,6 +1333,16 @@ class SpiaReq(BaseModel):
     age: int
     gender: str  # "male" | "female"
     payout_type: str = "life_only"  # see scripts/spia_calculator.py for valid values
+
+
+class ClientLogReq(BaseModel):
+    level: str = "info"
+    event: str
+    session_id: str | None = None
+    client_session_id: str | None = None
+    ts: str | None = None
+    page_url: str | None = None
+    data: dict[str, Any] | None = None
 
 
 # ---- routes ----------------------------------------------------------------
@@ -1040,6 +1360,16 @@ async def health():
         "avatar_id": AVATAR_ID or "(unset — set HEYGEN_AVATAR_ID in .env to a LiveAvatar avatar id)",
         "mode": SESSION_MODE,
         "model": LLM_MODEL,
+        "persona_mode": PERSONA_MODE,
+        "active_voice_id": active_voice_id(),
+        "cowboy_voice_configured": bool(COWBOY_VOICE_ID),
+        "tts_model": TTS_MODEL,
+        "llm_temperature": LLM_TEMPERATURE,
+        "voice_settings": {
+            "stability": active_voice_settings().stability,
+            "style": active_voice_settings().style,
+            "similarity_boost": active_voice_settings().similarity_boost,
+        },
     }
 
 
@@ -1074,6 +1404,32 @@ async def get_session_token():
     if not token:
         raise HTTPException(502, f"Unexpected token response: {payload}")
     return {"session_token": token}
+
+
+@app.post("/api/client-log")
+async def client_log(payload: ClientLogReq, request: Request):
+    """Receive browser-side diagnostics that App Runner cannot otherwise see.
+
+    LiveAvatar/LiveKit media is negotiated directly between the browser and
+    the vendor, so backend access logs only show token and app API calls. This
+    endpoint gives mobile Safari/Chrome a lightweight way to report SDK events,
+    video element state, autoplay/playback failures, and browser errors into
+    the normal App Runner application logs.
+    """
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "client_ts": payload.ts,
+        "ip": _client_ip(request),
+        "ua": (request.headers.get("user-agent") or "")[:240],
+        "level": (payload.level or "info")[:24],
+        "event": payload.event[:120],
+        "session_id": payload.session_id,
+        "client_session_id": payload.client_session_id,
+        "page_url": (payload.page_url or "")[:300],
+        "data": payload.data or {},
+    }
+    log.info("client-log %s", json.dumps(entry, ensure_ascii=False, default=str))
+    return {"ok": True}
 
 
 # ---- LLM tools (function calling) ------------------------------------------
@@ -1277,7 +1633,7 @@ async def llm(req: LlmReq, request: Request):
     history = _history.setdefault(req.session_id, [])
 
     context = await retrieve_context(req.user_text)
-    system = SYSTEM_PROMPT + load_user_context(user_id)
+    system = EFFECTIVE_SYSTEM_PROMPT + load_user_context(user_id)
     if context:
         system += (
             "\n\nRelevant excerpts from annuity documents "
@@ -1306,7 +1662,7 @@ async def llm(req: LlmReq, request: Request):
         messages=messages,
         tools=LLM_TOOLS,
         tool_choice="auto",
-        temperature=0.6,
+        temperature=LLM_TEMPERATURE,
     )
     msg = completion.choices[0].message
     calculator_result: dict | None = None
@@ -1354,7 +1710,7 @@ async def llm(req: LlmReq, request: Request):
         completion2 = await aclient.chat.completions.create(
             model=LLM_MODEL,
             messages=messages,
-            temperature=0.6,
+            temperature=LLM_TEMPERATURE,
         )
         reply = (completion2.choices[0].message.content or "").strip()
     else:
@@ -1384,20 +1740,36 @@ def tts(req: TtsReq):
     if not ELEVENLABS_API_KEY:
         raise HTTPException(500, "ELEVENLABS_API_KEY not set in .env")
     client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-    # eleven_flash_v2_5 is ElevenLabs' fastest model, optimized for conversational
-    # use cases. ~75ms first-byte latency vs ~300ms on Turbo. Voice cloning support
-    # is the same. Slightly different timbre — if the voice character doesn't hold
-    # up, fall back to "eleven_turbo_v2" (slower but original tone).
+
+    # Resolve model + voice settings: request overrides win (A/B testing),
+    # else fall back to the server's configured/active values (production).
+    model = req.model or TTS_MODEL
+    base = active_voice_settings()
+    settings = VoiceSettings(
+        stability=req.stability if req.stability is not None else base.stability,
+        similarity_boost=base.similarity_boost,
+        style=req.style if req.style is not None else base.style,
+        use_speaker_boost=True,
+        speed=base.speed,
+    )
+    as_mp3 = (req.fmt or "pcm").lower() == "mp3"
+    out_format = "mp3_44100_128" if as_mp3 else "pcm_24000"
+
     audio_gen = client.text_to_speech.convert(
-        voice_id=req.voice_id or ELEVENLABS_VOICE_ID,
-        text=req.text,
-        model_id="eleven_flash_v2_5",
-        output_format="pcm_24000",
-        voice_settings=VOICE_SETTINGS,
+        voice_id=req.voice_id or active_voice_id(),
+        text=_prep_tts_text(req.text, model),
+        model_id=model,
+        output_format=out_format,
+        voice_settings=settings,
     )
     audio_bytes = b"".join(audio_gen)
-    log.info("TTS: %d chars → %d PCM bytes", len(req.text), len(audio_bytes))
-    return Response(content=audio_bytes, media_type="application/octet-stream")
+    log.info(
+        "TTS: %d chars → %d bytes (model=%s stability=%s style=%s fmt=%s)",
+        len(req.text), len(audio_bytes), model, settings.stability, settings.style,
+        out_format,
+    )
+    media = "audio/mpeg" if as_mp3 else "application/octet-stream"
+    return Response(content=audio_bytes, media_type=media)
 
 
 # ---- Streaming pipeline (LLM → sentence → TTS → SSE) ----------------------
@@ -1444,17 +1816,36 @@ def _extract_complete_sentence(text: str) -> tuple[str, str]:
     return "", text
 
 
+# Eleven v3 interprets bracketed audio tags ([laughs], [shouting], ...) as
+# delivery direction; every other model reads them aloud literally. Strip
+# them unless we're actually on a v3 model so an outlandish persona that
+# emits tags can't break a non-v3 demo.
+_AUDIO_TAG_RE = re.compile(r"\[[A-Za-z][A-Za-z ]{0,24}\]")
+
+
+def _prep_tts_text(text: str, model: str) -> str:
+    if not (model or "").startswith("eleven_v3"):
+        return _AUDIO_TAG_RE.sub("", text)
+    return text
+
+
 def _stream_tts_bytes(text: str):
-    """Generator yielding PCM bytes from ElevenLabs Flash for a single sentence."""
+    """Generator yielding PCM bytes from ElevenLabs for a single sentence."""
     if not ELEVENLABS_API_KEY or not text.strip():
         return
+    text = _prep_tts_text(text, TTS_MODEL)
     client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
+    vs = active_voice_settings()
+    log.info(
+        "stream TTS: model=%s voice=%s stability=%s style=%s",
+        TTS_MODEL, active_voice_id(), vs.stability, vs.style,
+    )
     audio_gen = client.text_to_speech.convert(
-        voice_id=ELEVENLABS_VOICE_ID,
+        voice_id=active_voice_id(),
         text=text,
-        model_id="eleven_flash_v2_5",
+        model_id=TTS_MODEL,
         output_format="pcm_24000",
-        voice_settings=VOICE_SETTINGS,
+        voice_settings=active_voice_settings(),
     )
     for chunk in audio_gen:
         if chunk:
@@ -1535,7 +1926,7 @@ async def converse_stream(req: LlmReq, request: Request):
         try:
             history = _history.setdefault(req.session_id, [])
             context = await retrieve_context(req.user_text)
-            system = SYSTEM_PROMPT + load_user_context(user_id)
+            system = EFFECTIVE_SYSTEM_PROMPT + load_user_context(user_id)
             if context:
                 system += (
                     "\n\nRelevant excerpts from annuity documents "
@@ -1563,7 +1954,7 @@ async def converse_stream(req: LlmReq, request: Request):
                 messages=messages,
                 tools=LLM_TOOLS,
                 tool_choice="auto",
-                temperature=0.6,
+                temperature=LLM_TEMPERATURE,
                 stream=True,
             )
 
@@ -1650,7 +2041,7 @@ async def converse_stream(req: LlmReq, request: Request):
                         # the user said that wasn't answered yet.
                         if result.get("saved") and was_first_intro:
                             # Reload context — USER.md now exists with the name.
-                            updated_system = SYSTEM_PROMPT + load_user_context(user_id)
+                            updated_system = EFFECTIVE_SYSTEM_PROMPT + load_user_context(user_id)
                             if context:
                                 updated_system += (
                                     "\n\nRelevant excerpts from annuity documents "
@@ -1687,7 +2078,7 @@ async def converse_stream(req: LlmReq, request: Request):
                                 stream2 = await aclient.chat.completions.create(
                                     model=LLM_MODEL,
                                     messages=second_messages,
-                                    temperature=0.6,
+                                    temperature=LLM_TEMPERATURE,
                                     stream=True,
                                 )
                                 s2_buf = ""

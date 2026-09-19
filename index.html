@@ -176,6 +176,125 @@ const API = window.location.origin.startsWith("http")
 let session = null;
 let sessionId = null;       // we use the SDK's session info (or generate a short id) for backend keying
 let recognition = null, recognizing = false, pendingTranscript = "";
+const clientSessionId =
+    (window.crypto && window.crypto.randomUUID && window.crypto.randomUUID()) ||
+    "client-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+
+// ---------- Browser diagnostics ----------
+function errorSummary(err) {
+    if (!err) return { message: "unknown" };
+    if (err instanceof Event && err.type) return { type: err.type };
+    return {
+        name: err.name || err.constructor?.name || "Error",
+        message: err.message || String(err),
+        stack: err.stack ? String(err.stack).slice(0, 900) : undefined,
+    };
+}
+function mediaSnapshot() {
+    const stream = mediaEl.srcObject;
+    const tracks = stream && typeof stream.getTracks === "function"
+        ? stream.getTracks().map((t) => ({
+            kind: t.kind,
+            readyState: t.readyState,
+            enabled: t.enabled,
+            muted: t.muted,
+            label: t.label || "",
+        }))
+        : [];
+    return {
+        display: mediaEl.style.display,
+        paused: mediaEl.paused,
+        ended: mediaEl.ended,
+        readyState: mediaEl.readyState,
+        networkState: mediaEl.networkState,
+        currentTime: Number(mediaEl.currentTime || 0).toFixed(3),
+        videoWidth: mediaEl.videoWidth,
+        videoHeight: mediaEl.videoHeight,
+        muted: mediaEl.muted,
+        volume: mediaEl.volume,
+        hasSrcObject: !!stream,
+        tracks,
+    };
+}
+function browserSnapshot() {
+    return {
+        userAgent: navigator.userAgent,
+        platform: navigator.platform,
+        vendor: navigator.vendor,
+        language: navigator.language,
+        online: navigator.onLine,
+        visibilityState: document.visibilityState,
+        viewport: { width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio },
+        secureContext: window.isSecureContext,
+        mediaDevices: !!navigator.mediaDevices,
+        MediaRecorder: !!window.MediaRecorder,
+        WebSocket: !!window.WebSocket,
+    };
+}
+function logClient(event, data = {}, level = "info") {
+    const payload = {
+        level,
+        event,
+        session_id: sessionId,
+        client_session_id: clientSessionId,
+        ts: new Date().toISOString(),
+        page_url: window.location.href,
+        data,
+    };
+    const body = JSON.stringify(payload);
+    try {
+        if (navigator.sendBeacon) {
+            const ok = navigator.sendBeacon(`${API}/api/client-log`, new Blob([body], { type: "application/json" }));
+            if (ok) return;
+        }
+    } catch (_) {}
+    fetch(`${API}/api/client-log`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        keepalive: true,
+    }).catch(() => {});
+}
+function logMedia(event, extra = {}, level = "info") {
+    logClient(event, { ...extra, media: mediaSnapshot() }, level);
+}
+function attachMediaDiagnostics() {
+    const events = [
+        "loadstart", "loadedmetadata", "loadeddata", "canplay", "canplaythrough",
+        "play", "playing", "pause", "waiting", "stalled", "suspend", "resize",
+        "emptied", "abort", "error", "ended", "volumechange",
+    ];
+    for (const ev of events) {
+        mediaEl.addEventListener(ev, () => {
+            const level = ev === "error" || ev === "stalled" || ev === "abort" ? "warn" : "debug";
+            logMedia(`media.${ev}`, {
+                error: mediaEl.error ? {
+                    code: mediaEl.error.code,
+                    message: mediaEl.error.message,
+                } : null,
+            }, level);
+        });
+    }
+}
+attachMediaDiagnostics();
+
+window.addEventListener("error", (e) => {
+    logClient("browser.error", {
+        message: e.message,
+        source: e.filename,
+        lineno: e.lineno,
+        colno: e.colno,
+        error: errorSummary(e.error),
+    }, "error");
+});
+window.addEventListener("unhandledrejection", (e) => {
+    logClient("browser.unhandledrejection", { reason: errorSummary(e.reason) }, "error");
+});
+window.addEventListener("online", () => logClient("browser.online", browserSnapshot()));
+window.addEventListener("offline", () => logClient("browser.offline", browserSnapshot(), "warn"));
+document.addEventListener("visibilitychange", () => logClient("browser.visibilitychange", browserSnapshot()));
+window.addEventListener("pagehide", () => logClient("browser.pagehide", { persisted: false, media: mediaSnapshot() }, "warn"));
+logClient("page.loaded", browserSnapshot());
 
 // ---------- Transcript UI ----------
 function addTurn(who, text) {
@@ -564,35 +683,71 @@ $("summary-close").addEventListener("click", () => {
 startBtn.addEventListener("click", async () => {
     startBtn.disabled = true; startBtn.textContent = "Starting…";
     setStatus("Connecting…", false);
+    logClient("session.start_clicked", browserSnapshot());
 
     try {
         const tokenRes = await fetch(`${API}/api/token`, { method: "POST" });
         const tokenData = await tokenRes.json();
+        logClient("session.token_response", {
+            ok: tokenRes.ok,
+            status: tokenRes.status,
+            hasSessionToken: !!tokenData.session_token,
+            detail: tokenData.detail || null,
+        }, tokenRes.ok ? "info" : "error");
         if (!tokenRes.ok) throw new Error(tokenData.detail || JSON.stringify(tokenData));
 
         // Construct + start the SDK session. voiceChat:false because we'll do
         // push-to-talk via Web Speech API; flip to true to let LiveAvatar
         // capture the mic itself and pipe it over LiveKit.
         session = new LiveAvatarSession(tokenData.session_token, { voiceChat: false });
+        logClient("session.sdk_constructed", { sessionEventKeys: Object.keys(SessionEvent || {}) });
 
         // Surface the avatar transcription chunks in our UI as they arrive.
         let avatarBody = null;
         session.on(AgentEventsEnum.AVATAR_TRANSCRIPTION_CHUNK, (e) => {
+            logClient("agent.avatar_transcription_chunk", { textLength: (e.text || "").length }, "debug");
             if (!avatarBody) avatarBody = addTurn("avatar", "");
             avatarBody.textContent += e.text || "";
             transcriptEl.scrollTop = transcriptEl.scrollHeight;
         });
-        session.on(AgentEventsEnum.AVATAR_SPEAK_ENDED, () => { avatarBody = null; });
+        session.on(AgentEventsEnum.AVATAR_SPEAK_ENDED, () => {
+            logClient("agent.avatar_speak_ended", { media: mediaSnapshot() });
+            avatarBody = null;
+        });
         session.on(SessionEvent.SESSION_DISCONNECTED, (reason) => {
+            logClient("session.disconnected", { reason, media: mediaSnapshot() }, "warn");
             setStatus(`Disconnected (${reason})`, false);
         });
         session.on(SessionEvent.SESSION_STREAM_READY, () => {
-            session.attach(mediaEl);
-            mediaEl.style.display = "block";
-            placeholderEl.style.display = "none";
+            logMedia("session.stream_ready.before_attach");
+            try {
+                session.attach(mediaEl);
+                mediaEl.style.display = "block";
+                placeholderEl.style.display = "none";
+                logMedia("session.stream_ready.after_attach");
+                mediaEl.play()
+                    .then(() => logMedia("media.play_resolved"))
+                    .catch((err) => {
+                        logClient("media.play_rejected", {
+                            error: errorSummary(err),
+                            media: mediaSnapshot(),
+                        }, "error");
+                        setStatus("Stream attached, but the browser blocked video playback.", false);
+                    });
+                setTimeout(() => logMedia("media.snapshot_1s_after_attach"), 1000);
+                setTimeout(() => logMedia("media.snapshot_5s_after_attach"), 5000);
+            } catch (err) {
+                logClient("session.attach_failed", {
+                    error: errorSummary(err),
+                    media: mediaSnapshot(),
+                }, "error");
+                throw err;
+            }
         });
 
+        logClient("session.start_call.begin");
         await session.start();
+        logMedia("session.start_call.resolved");
 
         // Use a short identifier for backend conversation memory keying.
         // crypto.randomUUID() only exists in "secure contexts" (https or
@@ -613,6 +768,10 @@ startBtn.addEventListener("click", async () => {
         if (talkBtn.disabled) talkBtn.title = "Speech recognition not supported here. Use Chrome.";
     } catch (err) {
         console.error(err);
+        logClient("session.start_failed", {
+            error: errorSummary(err),
+            media: mediaSnapshot(),
+        }, "error");
         alert("Failed to start session:\n\n" + err.message);
         startBtn.disabled = false; startBtn.textContent = "Start session";
         setStatus("Disconnected", false);
@@ -621,15 +780,23 @@ startBtn.addEventListener("click", async () => {
 
 stopBtn.addEventListener("click", async () => {
     stopBtn.disabled = true;
+    logMedia("session.stop_clicked");
     try {
-        if (session) { await session.stop(); session = null; }
+        if (session) {
+            await session.stop();
+            logClient("session.stop_resolved");
+            session = null;
+        }
         if (sessionId) {
             fetch(`${API}/api/forget`, {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ session_id: sessionId }),
             }).catch(() => {});
         }
-    } catch (e) { console.warn(e); }
+    } catch (e) {
+        console.warn(e);
+        logClient("session.stop_failed", { error: errorSummary(e), media: mediaSnapshot() }, "warn");
+    }
     sessionId = null;
     mediaEl.style.display = "none";
     placeholderEl.style.display = "flex";
@@ -668,6 +835,7 @@ const PCM_REST_CHUNK  = 48000;   // 1 s chunks thereafter
 async function ask(text) {
     text = (text || "").trim();
     if (!text || !session || !sessionId) return;
+    logClient("ask.begin", { textLength: text.length, media: mediaSnapshot() });
     addTurn("user", text);
     inputEl.value = "";
     inputEl.disabled = true; askBtn.disabled = true; talkBtn.disabled = true;
@@ -706,7 +874,20 @@ async function ask(text) {
             const chunkDurationMs = (slice.byteLength / 48000) * 1000;
             const paceMs = Math.max(30, chunkDurationMs * 0.9);
             chunkSendInProgress = chunkSendInProgress.then(async () => {
-                try { session.repeatAudio(b64); } catch (e) { console.warn("repeatAudio failed", e); }
+                try {
+                    session.repeatAudio(b64);
+                    logClient("avatar.repeat_audio.sent", {
+                        bytes: slice.byteLength,
+                        durationMs: Math.round(chunkDurationMs),
+                    }, "debug");
+                } catch (e) {
+                    console.warn("repeatAudio failed", e);
+                    logClient("avatar.repeat_audio.failed", {
+                        error: errorSummary(e),
+                        bytes: slice.byteLength,
+                        media: mediaSnapshot(),
+                    }, "error");
+                }
                 await new Promise(r => setTimeout(r, paceMs));
             });
             if (flushAll && pcmBacklog.length === 0) return;
@@ -724,6 +905,7 @@ async function ask(text) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ session_id: sessionId, user_text: text }),
         });
+        logClient("ask.stream_response", { ok: res.ok, status: res.status });
         if (!res.ok) {
             const errText = await res.text();
             throw new Error(`stream ${res.status}: ${errText}`);
@@ -767,8 +949,10 @@ async function ask(text) {
         }
         // Wait for in-flight chunk sends to finish
         await chunkSendInProgress;
+        logMedia("ask.done");
     } catch (err) {
         console.error(err);
+        logClient("ask.failed", { error: errorSummary(err), media: mediaSnapshot() }, "error");
         if (!advisorBody) advisorBody = addTurn("avatar", "");
         advisorBody.textContent += "\n⚠️ " + err.message;
     } finally {
@@ -816,6 +1000,14 @@ async function setupMicrophone() {
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         window._micStream = stream;
+        logClient("mic.permission_granted", {
+            tracks: stream.getAudioTracks().map((t) => ({
+                readyState: t.readyState,
+                enabled: t.enabled,
+                muted: t.muted,
+                label: t.label || "",
+            })),
+        });
         return true;
     } catch (err) {
         const msg = err.name === "NotAllowedError"
@@ -823,6 +1015,7 @@ async function setupMicrophone() {
             : `Microphone unavailable: ${err.message}`;
         setStatus(msg, false);
         console.warn("Mic setup failed:", err);
+        logClient("mic.permission_failed", { error: errorSummary(err) }, "warn");
         return false;
     }
 }
@@ -838,13 +1031,16 @@ async function pickRecordingMode() {
         if (res.ok) {
             recordingMode = "deepgram";
             console.info("[stt] using Deepgram streaming");
+            logClient("stt.mode_selected", { mode: "deepgram" });
         } else {
             recordingMode = "whisper";
             console.info(`[stt] /api/deepgram-token returned ${res.status} — falling back to Whisper`);
+            logClient("stt.mode_selected", { mode: "whisper", deepgramStatus: res.status }, "warn");
         }
     } catch (e) {
         recordingMode = "whisper";
         console.warn("[stt] /api/deepgram-token probe failed — falling back to Whisper:", e);
+        logClient("stt.mode_probe_failed", { error: errorSummary(e) }, "warn");
     }
 }
 
@@ -858,8 +1054,10 @@ async function startDeepgramRecording() {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         token = (await r.json()).token;
         if (!token) throw new Error("no token in response");
+        logClient("deepgram.token_received");
     } catch (e) {
         console.warn("[stt] token fetch failed — falling back to Whisper for this turn:", e);
+        logClient("deepgram.token_failed", { error: errorSummary(e) }, "warn");
         recordingMode = "whisper";
         return startWhisperRecording();
     }
@@ -890,17 +1088,28 @@ async function startDeepgramRecording() {
     // useful client-side error).
     deepgramSocket = new WebSocket(url, ["bearer", token]);
     deepgramSocket.binaryType = "arraybuffer";
+    deepgramSocket.addEventListener("close", (e) => {
+        logClient("deepgram.ws_close", { code: e.code, reason: e.reason, wasClean: e.wasClean }, e.wasClean ? "info" : "warn");
+    });
+    deepgramSocket.addEventListener("error", (e) => {
+        logClient("deepgram.ws_error", { error: errorSummary(e) }, "warn");
+    });
 
     // Wait for the socket to open before starting the recorder, otherwise
     // the first audio chunks would be silently dropped.
     try {
         await new Promise((resolve, reject) => {
             const t = setTimeout(() => reject(new Error("Deepgram connect timeout")), 5000);
-            deepgramSocket.addEventListener("open", () => { clearTimeout(t); resolve(); }, { once: true });
+            deepgramSocket.addEventListener("open", () => {
+                clearTimeout(t);
+                logClient("deepgram.ws_open");
+                resolve();
+            }, { once: true });
             deepgramSocket.addEventListener("error", (e) => { clearTimeout(t); reject(e); }, { once: true });
         });
     } catch (e) {
         console.warn("[stt] Deepgram WS failed to open — falling back to Whisper:", e);
+        logClient("deepgram.ws_open_failed", { error: errorSummary(e) }, "warn");
         try { deepgramSocket.close(); } catch (_) {}
         deepgramSocket = null;
         recordingMode = "whisper";
@@ -936,6 +1145,7 @@ async function startDeepgramRecording() {
         }
     };
     mediaRecorder.start(250);
+    logClient("recording.start", { mode: "deepgram", mimeType: mediaRecorder.mimeType });
 
     recognizing = true;
     talkBtn.classList.add("recording");
@@ -975,9 +1185,11 @@ async function stopDeepgramRecording() {
     talkBtn.disabled = false;
 
     if (text) {
+        logClient("recording.stop", { mode: "deepgram", textLength: text.length });
         inputEl.value = text;
         ask(text);
     } else {
+        logClient("recording.stop_no_text", { mode: "deepgram" }, "warn");
         setStatus("Couldn't hear anything — try again.", false);
     }
 }
@@ -989,6 +1201,7 @@ async function startWhisperRecording() {
         mediaRecorder = new MediaRecorder(window._micStream);
         mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
         mediaRecorder.start();
+        logClient("recording.start", { mode: "whisper", mimeType: mediaRecorder.mimeType });
         recognizing = true;
         talkBtn.classList.add("recording");
         talkBtn.textContent = "● Recording — press Ctrl+M to send";
@@ -1012,6 +1225,7 @@ async function stopWhisperRecording() {
     });
 
     if (audioChunks.length === 0) {
+        logClient("recording.stop_no_chunks", { mode: "whisper" }, "warn");
         talkBtn.textContent = "🎤 Press Ctrl+M to speak";
         talkBtn.disabled = false;
         return;
@@ -1030,13 +1244,16 @@ async function stopWhisperRecording() {
         const data = await res.json();
         const text = (data.text || "").trim();
         if (text) {
+            logClient("recording.stop", { mode: "whisper", textLength: text.length });
             inputEl.value = text;
             ask(text);
         } else {
+            logClient("recording.stop_no_text", { mode: "whisper" }, "warn");
             setStatus("Couldn't hear anything — try again.", false);
         }
     } catch (err) {
         console.warn("Transcription fetch failed:", err);
+        logClient("recording.transcription_failed", { mode: "whisper", error: errorSummary(err) }, "error");
         setStatus("Transcription failed: " + err.message, false);
     } finally {
         talkBtn.textContent = "🎤 Press Ctrl+M to speak";
