@@ -258,6 +258,41 @@ function logClient(event, data = {}, level = "info") {
 function logMedia(event, extra = {}, level = "info") {
     logClient(event, { ...extra, media: mediaSnapshot() }, level);
 }
+
+async function ensureVideoPlayback(reason, { muted = mediaEl.muted } = {}) {
+    mediaEl.muted = muted;
+    mediaEl.playsInline = true;
+    try {
+        await mediaEl.play();
+        logMedia("media.ensure_play_resolved", { reason, muted: mediaEl.muted });
+        return true;
+    } catch (err) {
+        logClient("media.ensure_play_rejected", {
+            reason,
+            muted: mediaEl.muted,
+            error: errorSummary(err),
+            media: mediaSnapshot(),
+        }, "warn");
+        return false;
+    }
+}
+
+function attachAutoplayRecovery() {
+    let attemptedMutedRecovery = false;
+    const recover = () => {
+        if (!session || mediaEl.style.display !== "block" || !mediaEl.paused) return;
+        if (!attemptedMutedRecovery) {
+            attemptedMutedRecovery = true;
+            ensureVideoPlayback("autoplay_recovery_muted", { muted: true });
+        }
+    };
+    mediaEl.addEventListener("loadedmetadata", recover);
+    mediaEl.addEventListener("canplay", recover);
+    mediaEl.addEventListener("pause", () => {
+        setTimeout(recover, 150);
+    });
+}
+attachAutoplayRecovery();
 function attachMediaDiagnostics() {
     const events = [
         "loadstart", "loadedmetadata", "loadeddata", "canplay", "canplaythrough",
@@ -722,10 +757,11 @@ startBtn.addEventListener("click", async () => {
             logMedia("session.stream_ready.before_attach");
             try {
                 session.attach(mediaEl);
+                mediaEl.playsInline = true;
                 mediaEl.style.display = "block";
                 placeholderEl.style.display = "none";
                 logMedia("session.stream_ready.after_attach");
-                mediaEl.play()
+                ensureVideoPlayback("stream_ready", { muted: false })
                     .then(() => logMedia("media.play_resolved"))
                     .catch((err) => {
                         logClient("media.play_rejected", {
@@ -836,6 +872,9 @@ async function ask(text) {
     text = (text || "").trim();
     if (!text || !session || !sessionId) return;
     logClient("ask.begin", { textLength: text.length, media: mediaSnapshot() });
+    if (mediaEl.muted || mediaEl.paused) {
+        await ensureVideoPlayback("ask_user_interaction_unmute", { muted: false });
+    }
     addTurn("user", text);
     inputEl.value = "";
     inputEl.disabled = true; askBtn.disabled = true; talkBtn.disabled = true;
